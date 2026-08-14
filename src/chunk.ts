@@ -1,6 +1,5 @@
 import type { LyricRecord } from "./types";
 import { prepareInput, toApiResponse, DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT } from "./types";
-import { FILES_PER_ROOM } from "./config";
 import type { Request as PartyRequest, Room, Server } from "partykit/server";
 
 export default class ChunkServer implements Server {
@@ -27,17 +26,17 @@ export default class ChunkServer implements Server {
     }
 
     const t0 = Date.now();
-    for (let part = 0; part < FILES_PER_ROOM; part++) {
+    for (let part = 0; ; part++) {
       const path = `/data/chunk-${this.chunkIndex}-${part}.json`;
       try {
         const res = await this.room.context.assets.fetch(path);
-        if (res && res.status === 200) {
-          const text = await res.text();
-          const partRecords = JSON.parse(text) as LyricRecord[];
-          this.records.push(...partRecords);
-        }
+        if (!res || res.status !== 200) break;
+        const text = await res.text();
+        const partRecords = JSON.parse(text) as LyricRecord[];
+        this.records.push(...partRecords);
       } catch (e) {
         console.error(`Failed to load ${path}: ${e}`);
+        break;
       }
     }
 

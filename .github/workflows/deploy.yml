@@ -9,6 +9,7 @@ env:
   DUMP_URL: https://db-dumps.lrclib.net/lrclib-db-dump-20260807T082319Z.sqlite3.gz
   GZIP_PATH: /tmp/lrclib-db.sqlite3.gz
   MANIFEST_PATH: /tmp/manifest.json
+  CHUNK_DIR: /tmp/chunks
   MOUNT_POINT: /tmp/fuse_data
   PUBLIC_DIR: public/data
 
@@ -30,7 +31,7 @@ jobs:
 
       - name: Install Python dependencies
         run: |
-          pip install --no-cache-dir rapidgzip apsw mfusepy
+          pip install --no-cache-dir rapidgzip apsw mfusepy orjson zstandard
 
       - name: Install Node dependencies
         run: bun install
@@ -39,9 +40,14 @@ jobs:
         run: |
           aria2c -x 16 -s 16 -d /tmp -o lrclib-db.sqlite3.gz "$DUMP_URL"
 
-      - name: Generate manifest
+      - name: Generate manifest and chunk files
         run: |
-          python scripts/generate_manifest.py "$GZIP_PATH" "$MANIFEST_PATH" "src/config.ts"
+          python scripts/generate_manifest.py "$GZIP_PATH" "$MANIFEST_PATH" "src/config.ts" "$CHUNK_DIR"
+
+      - name: Clean up gzip to free disk
+        run: |
+          rm -f "$GZIP_PATH"
+          df -h /tmp
 
       - name: Prepare public directory
         run: |
@@ -51,7 +57,7 @@ jobs:
       - name: Mount FUSE filesystem
         run: |
           mkdir -p "$MOUNT_POINT"
-          python scripts/fuse_vfs.py "$MANIFEST_PATH" "$GZIP_PATH" "$MOUNT_POINT" &
+          python scripts/fuse_vfs.py "$MANIFEST_PATH" "$CHUNK_DIR" "$MOUNT_POINT" &
           FUSE_PID=$!
           echo "FUSE_PID=$FUSE_PID" >> $GITHUB_ENV
           sleep 10
@@ -78,5 +84,5 @@ jobs:
             fusermount -u "$MOUNT_POINT" 2>/dev/null || true
             kill $FUSE_PID 2>/dev/null || true
           fi
-          rm -f "$GZIP_PATH" "$MANIFEST_PATH"
-          rm -rf "$PUBLIC_DIR"
+          rm -f "$MANIFEST_PATH"
+          rm -rf "$PUBLIC_DIR" "$CHUNK_DIR"

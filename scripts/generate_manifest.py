@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
 """
-Generate manifest from LRCLIB SQLite DB via RapidgzipFile + APSW VFS.
+Generate manifest and zstd-compressed chunk files from LRCLIB SQLite DB.
 
 Two-pass sequential scan (no JOIN) to avoid random access through gzip.
-Pass 1: sequential scan of tracks -> in-memory metadata + room assignment + lyrics mapping
-Pass 2: sequential scan of lyrics -> merge with track metadata, compute JSON size, finalize file boundaries
+Pass 1: Scan tracks -> metadata + room assignment + lyrics mapping
+Pass 2: Scan lyrics -> construct records -> write to zstd chunk files
 
-Key optimizations vs previous version:
-  - Pass 1 pre-computes normalize() and room_idx, avoiding 2x normalize calls in Pass 2
-  - Pass 1 accumulates per-record JSON size (no lyrics fields yet)
-  - Pass 2 adds only the delta from lyrics fields (plain, synced, lyricsfile, instrumental)
-  - 19 MB cap instead of 18 MB (stay under 20 MB with margin)
-  - 6200 rooms (2x) to halve overflow risk, each room ~33 MB / 2 files
-  - orjson for 2-5x faster serialization
-  - Files per room is soft (overflow creates extra files, no data loss)
+Output:
+  - manifest.json: file list with uncompressed sizes (for FUSE)
+  - src/config.ts: TOTAL_ROOMS, TOTAL_FILES
+  - chunk-{room}-{part}.json.zst files in chunk directory
 """
 
 import os
@@ -22,7 +18,10 @@ import json
 import time
 import struct
 import array
+import unicodedata
+import shutil
 import apsw
+import zstandard
 from rapidgzip import RapidgzipFile
 
 try:
@@ -32,15 +31,14 @@ except ImportError:
     HAVE_ORJSON = False
 
 GZIP_PATH = sys.argv[1]
-OUTPUT_PATH = sys.argv[2] if len(sys.argv) > 2 else "manifest.json"
+MANIFEST_PATH = sys.argv[2] if len(sys.argv) > 2 else "manifest.json"
 CONFIG_TS_PATH = sys.argv[3] if len(sys.argv) > 3 else "src/config.ts"
+CHUNK_DIR = sys.argv[4] if len(sys.argv) > 4 else "chunks"
 
-MAX_FILE_SIZE = 19 * 1024 * 1024  # 19 MiB (stay under 20 MB PartyKit limit)
-FILES_PER_ROOM_SOFT = 4          # soft target, overflow creates extra files
-JSON_ARRAY_OVERHEAD = 2          # "[" + "]"
-JSON_COMMA = 1                   # "," between items with compact separators
+MAX_FILE_SIZE = 18 * 1024 * 1024
+ZSTD_LEVEL = 3
 KNOWN_TRACK_COUNT = 32254478
-KNOWN_LYRICS_COUNT = 32680034
+ESTIMATED_TOTAL_JSON = 218552162543
 
 
 class GzipVFSFile:
@@ -138,7 +136,6 @@ class GzipVFS(apsw.VFS):
 def normalize(text):
     if not text:
         return ""
-    import unicodedata
     s = unicodedata.normalize("NFKC", text).lower()
     for c in "`~!@#$%^&*()_|+-=?;:\",.<>{}[]\\/\x00\n":
         s = s.replace(c, " ")
@@ -160,38 +157,63 @@ def dumps_json(obj):
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
-class RoomState:
-    __slots__ = ("files", "current_file", "current_size", "file_count")
+class RoomWriter:
+    """Writes records to zstd-compressed chunk files for one room."""
 
-    def __init__(self, room_idx):
-        f = {"name": f"chunk-{room_idx}-0.json", "size": JSON_ARRAY_OVERHEAD, "track_ids": []}
-        self.files = [f]
-        self.current_file = f
-        self.current_size = JSON_ARRAY_OVERHEAD
-        self.file_count = 1
+    __slots__ = ("room_idx", "chunk_dir", "part", "handle", "compressor",
+                 "uncompressed_size", "record_count", "files")
 
-    def add(self, track_id, json_size):
-        comma = JSON_COMMA if self.current_file["track_ids"] else 0
-        record_bytes = json_size + comma
+    def __init__(self, room_idx, chunk_dir):
+        self.room_idx = room_idx
+        self.chunk_dir = chunk_dir
+        self.part = 0
+        self.handle = None
+        self.compressor = None
+        self.uncompressed_size = 0
+        self.record_count = 0
+        self.files = []
 
-        if self.current_size + record_bytes > MAX_FILE_SIZE:
-            new_idx = self.file_count
-            f = {
-                "name": f"chunk-{self.room_idx}-{new_idx}.json",
-                "size": JSON_ARRAY_OVERHEAD,
-                "track_ids": [],
-            }
-            self.files.append(f)
-            self.current_file = f
-            self.current_size = JSON_ARRAY_OVERHEAD
-            self.file_count += 1
-            self.current_file["track_ids"].append(track_id)
-            self.current_file["size"] += json_size
-            self.current_size += json_size
-        else:
-            self.current_file["track_ids"].append(track_id)
-            self.current_file["size"] += record_bytes
-            self.current_size += record_bytes
+    def _open_new_file(self):
+        path = os.path.join(self.chunk_dir, f"chunk-{self.room_idx}-{self.part}.json.zst")
+        self.handle = open(path, "wb")
+        cctx = zstandard.ZstdCompressor(level=ZSTD_LEVEL)
+        self.compressor = cctx.stream_writer(self.handle)
+        self.compressor.write(b"[")
+        self.uncompressed_size = 1
+        self.record_count = 0
+
+    def write_record(self, json_bytes):
+        if self.compressor is None:
+            self._open_new_file()
+
+        if self.record_count > 0:
+            self.compressor.write(b",")
+            self.uncompressed_size += 1
+
+        self.compressor.write(json_bytes)
+        self.uncompressed_size += len(json_bytes)
+        self.record_count += 1
+
+        if self.uncompressed_size >= MAX_FILE_SIZE:
+            self._close_current_file()
+
+    def _close_current_file(self):
+        if self.compressor is None:
+            return
+        self.compressor.write(b"]")
+        self.uncompressed_size += 1
+        self.compressor.close()
+        self.handle = None
+        self.files.append({
+            "name": f"chunk-{self.room_idx}-{self.part}.json",
+            "size": self.uncompressed_size,
+        })
+        self.compressor = None
+        self.part += 1
+
+    def flush(self):
+        if self.compressor is not None:
+            self._close_current_file()
 
 
 def main():
@@ -221,10 +243,16 @@ def main():
     cur = conn.cursor()
     cur2 = conn.cursor()
 
-    max_track_id = KNOWN_TRACK_COUNT
+    shutil.rmtree(CHUNK_DIR, ignore_errors=True)
+    os.makedirs(CHUNK_DIR, exist_ok=True)
 
-    # Pre-allocate arrays for track metadata
-    # Each track: name, artist, album (strings), duration (float), name_lower, artist_lower, album_lower (strings)
+    room_target = 72 * 1024 * 1024
+    num_rooms = max(1, int(ESTIMATED_TOTAL_JSON / room_target))
+    num_rooms = ((num_rooms + 99) // 100) * 100
+    num_rooms = num_rooms * 2
+    print(f"Estimated rooms: {num_rooms}", flush=True)
+
+    max_track_id = KNOWN_TRACK_COUNT
     track_names = [None] * (max_track_id + 1)
     track_artists = [None] * (max_track_id + 1)
     track_albums = [None] * (max_track_id + 1)
@@ -232,31 +260,11 @@ def main():
     track_name_lower = [None] * (max_track_id + 1)
     track_artist_lower = [None] * (max_track_id + 1)
     track_album_lower = [None] * (max_track_id + 1)
-    track_room_idx = array.array("I", [0] * (max_track_id + 1))  # unsigned 32-bit
-    track_base_json_bytes = array.array("I", [0] * (max_track_id + 1))  # base JSON size without lyrics fields
+    track_room_idx = array.array("I", [0] * (max_track_id + 1))
     track_matched = bytearray(max_track_id + 1)
 
-    # lyrics_id -> list of track_ids
     lyrics_to_track = {}
     null_lyrics_track_ids = []
-
-    # Estimate rooms: 203 GiB / 19 MB per file / 4 files per room
-    # But with 2x rooms, each room gets ~2 files -> less overflow risk
-    # 203 GiB / (19 MB * 2) = ~5600 rooms
-    estimated_total = 218552162543  # from previous run
-    room_target = MAX_FILE_SIZE * FILES_PER_ROOM_SOFT
-    num_rooms = max(1, int(estimated_total / room_target))
-    # Round up to nearest 100
-    num_rooms = ((num_rooms + 99) // 100) * 100
-    # Use 2x rooms to reduce per-room data size and overflow risk
-    num_rooms = num_rooms * 2
-    print(f"Estimated rooms: {num_rooms} (2x to reduce overflow)", flush=True)
-
-    # Initialize rooms
-    rooms = [RoomState(i) for i in range(num_rooms)]
-    # Set room_idx on each (needed for add() to name new files)
-    for i, r in enumerate(rooms):
-        r.room_idx = i
 
     print("\n=== PASS 1: Scanning tracks (sequential) ===", flush=True)
     t1 = time.time()
@@ -266,7 +274,6 @@ def main():
     ):
         track_id = row[0]
         if track_id > max_track_id:
-            # Extend arrays
             extend = track_id - max_track_id
             track_names.extend([None] * extend)
             track_artists.extend([None] * extend)
@@ -276,7 +283,6 @@ def main():
             track_artist_lower.extend([None] * extend)
             track_album_lower.extend([None] * extend)
             track_room_idx.extend([0] * extend)
-            track_base_json_bytes.extend([0] * extend)
             track_matched.extend(bytearray(extend))
             max_track_id = track_id
 
@@ -286,43 +292,20 @@ def main():
         duration = row[4] if row[4] is not None else 0.0
         last_lyrics_id = row[5]
 
-        name_lower = normalize(name)
-        artist_lower = normalize(artist)
-        album_lower = normalize(album)
+        nl = normalize(name)
+        al = normalize(artist)
+        bl = normalize(album)
 
         track_names[track_id] = name
         track_artists[track_id] = artist
         track_albums[track_id] = album
         track_durations[track_id] = duration
-        track_name_lower[track_id] = name_lower
-        track_artist_lower[track_id] = artist_lower
-        track_album_lower[track_id] = album_lower
+        track_name_lower[track_id] = nl
+        track_artist_lower[track_id] = al
+        track_album_lower[track_id] = bl
 
-        room_idx = fnv1a_hash((artist_lower + " " + name_lower).encode("utf-8")) % num_rooms
+        room_idx = fnv1a_hash((al + " " + nl).encode("utf-8")) % num_rooms
         track_room_idx[track_id] = room_idx
-
-        # Compute base JSON size (record without lyrics fields)
-        # We'll add lyrics fields in Pass 2
-        # Base record has: id, name, trackName, artistName, albumName, duration,
-        #   instrumental(false), plainLyrics(null), syncedLyrics(null), lyricsfile(null),
-        #   nameLower, artistNameLower, albumNameLower
-        base_rec = {
-            "id": track_id,
-            "name": name,
-            "trackName": name,
-            "artistName": artist,
-            "albumName": album,
-            "duration": duration,
-            "instrumental": False,
-            "plainLyrics": None,
-            "syncedLyrics": None,
-            "lyricsfile": None,
-            "nameLower": name_lower,
-            "artistNameLower": artist_lower,
-            "albumNameLower": album_lower,
-        }
-        base_bytes = len(dumps_json(base_rec))
-        track_base_json_bytes[track_id] = base_bytes
 
         if last_lyrics_id is not None:
             if last_lyrics_id in lyrics_to_track:
@@ -338,18 +321,42 @@ def main():
 
     print(f"Pass 1 done: {track_count} tracks in {time.time()-t1:.1f}s", flush=True)
     print(f"  NULL last_lyrics_id: {len(null_lyrics_track_ids)}", flush=True)
-    print(f"  multi-track lyrics: {sum(1 for v in lyrics_to_track.values() if len(v) > 1)}", flush=True)
 
-    # Add null-lyrics tracks to manifest immediately (base JSON is their final JSON)
+    room_writers = {}
     total_records = 0
     total_json_bytes = 0
+
+    print("\n=== Writing null-lyrics tracks ===", flush=True)
+    t_null = time.time()
     for track_id in null_lyrics_track_ids:
         room_idx = track_room_idx[track_id]
-        json_size = track_base_json_bytes[track_id]
-        rooms[room_idx].add(track_id, json_size)
+        rw = room_writers.get(room_idx)
+        if rw is None:
+            rw = RoomWriter(room_idx, CHUNK_DIR)
+            room_writers[room_idx] = rw
+
+        rec = {
+            "id": track_id,
+            "name": track_names[track_id],
+            "trackName": track_names[track_id],
+            "artistName": track_artists[track_id],
+            "albumName": track_albums[track_id],
+            "duration": track_durations[track_id],
+            "instrumental": False,
+            "plainLyrics": None,
+            "syncedLyrics": None,
+            "lyricsfile": None,
+            "nameLower": track_name_lower[track_id],
+            "artistNameLower": track_artist_lower[track_id],
+            "albumNameLower": track_album_lower[track_id],
+        }
+        jb = dumps_json(rec)
+        rw.write_record(jb)
+        track_matched[track_id] = 1
         total_records += 1
-        total_json_bytes += json_size
-    print(f"  NULL-lyrics tracks added: {len(null_lyrics_track_ids)}", flush=True)
+        total_json_bytes += len(jb)
+    print(f"  Null-lyrics written: {len(null_lyrics_track_ids)} ({time.time()-t_null:.1f}s)", flush=True)
+    del null_lyrics_track_ids
 
     print("\n=== PASS 2: Scanning lyrics (sequential) ===", flush=True)
     t2 = time.time()
@@ -375,46 +382,32 @@ def main():
             if track_id > max_track_id or track_names[track_id] is None:
                 continue
 
-            name = track_names[track_id]
-            artist = track_artists[track_id]
-            album = track_albums[track_id]
-            duration = track_durations[track_id]
-            name_lower = track_name_lower[track_id]
-            artist_lower = track_artist_lower[track_id]
-            album_lower = track_album_lower[track_id]
             room_idx = track_room_idx[track_id]
-            base_bytes = track_base_json_bytes[track_id]
+            rw = room_writers.get(room_idx)
+            if rw is None:
+                rw = RoomWriter(room_idx, CHUNK_DIR)
+                room_writers[room_idx] = rw
 
-            # Compute delta: replace null fields with actual lyrics
-            # Instead of re-serializing the whole record, estimate the delta
-            # Base had: "plainLyrics":null,"syncedLyrics":null,"lyricsfile":null
-            # Now: "plainLyrics":"...","syncedLyrics":"...","lyricsfile":"..."
-            # The delta is: (serialized actual values) - (serialized null values)
-            # "plainLyrics":null = 16 bytes, "syncedLyrics":null = 18 bytes, "lyricsfile":null = 16 bytes
-            # "instrumental":false = 18 bytes -> "instrumental":true = 17 bytes (delta -1)
-
-            # Simplest correct approach: serialize the full record
             rec = {
                 "id": track_id,
-                "name": name,
-                "trackName": name,
-                "artistName": artist,
-                "albumName": album,
-                "duration": duration,
+                "name": track_names[track_id],
+                "trackName": track_names[track_id],
+                "artistName": track_artists[track_id],
+                "albumName": track_albums[track_id],
+                "duration": track_durations[track_id],
                 "instrumental": instrumental,
                 "plainLyrics": plain_lyrics,
                 "syncedLyrics": synced_lyrics,
                 "lyricsfile": lyricsfile,
-                "nameLower": name_lower,
-                "artistNameLower": artist_lower,
-                "albumNameLower": album_lower,
+                "nameLower": track_name_lower[track_id],
+                "artistNameLower": track_artist_lower[track_id],
+                "albumNameLower": track_album_lower[track_id],
             }
-            json_size = len(dumps_json(rec))
-
-            rooms[room_idx].add(track_id, json_size)
+            jb = dumps_json(rec)
+            rw.write_record(jb)
             track_matched[track_id] = 1
             total_records += 1
-            total_json_bytes += json_size
+            total_json_bytes += len(jb)
             matched_count += 1
 
         lyrics_count += 1
@@ -424,63 +417,75 @@ def main():
     print(f"Pass 2 done: {lyrics_count} lyrics in {time.time()-t2:.1f}s", flush=True)
     print(f"  matched tracks: {matched_count}", flush=True)
 
-    # Add unmatched tracks (last_lyrics_id pointing to missing lyrics)
+    del lyrics_to_track
+
+    print("\n=== Writing unmatched tracks ===", flush=True)
+    t_unm = time.time()
     unmatched_count = 0
     for track_id in range(1, max_track_id + 1):
         if track_names[track_id] is not None and not track_matched[track_id]:
             room_idx = track_room_idx[track_id]
-            json_size = track_base_json_bytes[track_id]
-            rooms[room_idx].add(track_id, json_size)
-            total_records += 1
-            total_json_bytes += json_size
-            unmatched_count += 1
-    print(f"  unmatched tracks added: {unmatched_count}", flush=True)
+            rw = room_writers.get(room_idx)
+            if rw is None:
+                rw = RoomWriter(room_idx, CHUNK_DIR)
+                room_writers[room_idx] = rw
 
-    # Free memory
+            rec = {
+                "id": track_id,
+                "name": track_names[track_id],
+                "trackName": track_names[track_id],
+                "artistName": track_artists[track_id],
+                "albumName": track_albums[track_id],
+                "duration": track_durations[track_id],
+                "instrumental": False,
+                "plainLyrics": None,
+                "syncedLyrics": None,
+                "lyricsfile": None,
+                "nameLower": track_name_lower[track_id],
+                "artistNameLower": track_artist_lower[track_id],
+                "albumNameLower": track_album_lower[track_id],
+            }
+            jb = dumps_json(rec)
+            rw.write_record(jb)
+            total_records += 1
+            total_json_bytes += len(jb)
+            unmatched_count += 1
+    print(f"  Unmatched: {unmatched_count} ({time.time()-t_unm:.1f}s)", flush=True)
+
     del track_names, track_artists, track_albums, track_durations
     del track_name_lower, track_artist_lower, track_album_lower
-    del track_room_idx, track_base_json_bytes, track_matched
-    del lyrics_to_track, null_lyrics_track_ids
+    del track_room_idx, track_matched
+
+    print("\n=== Flushing room writers ===", flush=True)
+    t_flush = time.time()
+    all_files = []
+    for room_idx in sorted(room_writers.keys()):
+        rw = room_writers[room_idx]
+        rw.flush()
+        all_files.extend(rw.files)
+    del room_writers
+    print(f"  Flushed in {time.time()-t_flush:.1f}s", flush=True)
 
     print(f"\nTotal records: {total_records}", flush=True)
     print(f"Total JSON: {total_json_bytes} ({total_json_bytes/1073741824:.2f} GiB)", flush=True)
+    print(f"Chunk files: {len(all_files)}", flush=True)
+    print(f"Rooms with data: {sum(1 for f in all_files)}", flush=True)
 
-    # Build flat file list
-    files = []
-    overflow_rooms = 0
-    max_files_in_room = 0
-    for room in rooms:
-        if len(room.files) > FILES_PER_ROOM_SOFT:
-            overflow_rooms += 1
-        if len(room.files) > max_files_in_room:
-            max_files_in_room = len(room.files)
-        for f in room.files:
-            files.append(f)
-
-    print(f"Manifest: {len(files)} files, {num_rooms} rooms", flush=True)
-    print(f"Overflow rooms (> {FILES_PER_ROOM_SOFT} files): {overflow_rooms}", flush=True)
-    print(f"Max files in a room: {max_files_in_room}", flush=True)
-
-    # Verify no file exceeds 20 MB
-    oversized = sum(1 for f in files if f["size"] > 20 * 1024 * 1024)
+    oversized = sum(1 for f in all_files if f["size"] > 20 * 1024 * 1024)
     if oversized > 0:
         print(f"WARNING: {oversized} files exceed 20 MB!", flush=True)
-        max_size = max(f["size"] for f in files)
+        max_size = max(f["size"] for f in all_files)
         print(f"  Max file size: {max_size} bytes ({max_size/1048576:.2f} MB)", flush=True)
 
     manifest = {
         "total_records": total_records,
         "total_json_bytes": total_json_bytes,
-        "total_files": len(files),
-        "files_per_room": FILES_PER_ROOM_SOFT,
+        "total_files": len(all_files),
         "total_rooms": num_rooms,
-        "num_chunks": num_rooms,
-        "max_file_size": MAX_FILE_SIZE,
-        "overflow_rooms": overflow_rooms,
-        "files": files,
+        "files": all_files,
     }
 
-    with open(OUTPUT_PATH, "wb") as f:
+    with open(MANIFEST_PATH, "wb") as f:
         if HAVE_ORJSON:
             f.write(orjson.dumps(manifest))
         else:
@@ -491,9 +496,7 @@ def main():
     with open(CONFIG_TS_PATH, "w") as f:
         f.write("// AUTO-GENERATED by scripts/generate_manifest.py. Do not edit manually.\n")
         f.write(f"export const TOTAL_ROOMS = {num_rooms};\n")
-        f.write(f"export const FILES_PER_ROOM = {FILES_PER_ROOM_SOFT};\n")
-        f.write(f"export const TOTAL_FILES = {len(files)};\n")
-        f.write(f"export const NUM_CHUNKS = {num_rooms};\n")
+        f.write(f"export const TOTAL_FILES = {len(all_files)};\n")
     print(f"  config.ts written to {CONFIG_TS_PATH}", flush=True)
     print(f"  Total time: {time.time()-t0:.1f}s", flush=True)
 

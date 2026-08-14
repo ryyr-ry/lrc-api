@@ -34,8 +34,6 @@ export function hashPartition(artistName: string, trackName: string, numChunks: 
   return (h >>> 0) % numChunks;
 }
 
-export const MAX_FILE_SIZE = 18 * 1024 * 1024;
-export const FILES_PER_ROOM = 4;
 export const DEFAULT_SEARCH_LIMIT = 20;
 export const MAX_SEARCH_LIMIT = 50;
 

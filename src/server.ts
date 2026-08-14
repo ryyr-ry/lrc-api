@@ -1,5 +1,5 @@
 import { hashPartition, MAX_SEARCH_LIMIT } from "./types";
-import { TOTAL_ROOMS, FILES_PER_ROOM } from "./config";
+import { TOTAL_ROOMS } from "./config";
 import type { Request as PartyRequest, FetchLobby, Cron, CronLobby, PartyKitServer } from "partykit/server";
 import type { ExecutionContext as CFExecutionContext } from "@cloudflare/workers-types";
 
@@ -28,7 +28,7 @@ function errorResponse(code: number, name: string, message: string): Response {
 async function handleApiGet(
   req: PartyRequest,
   lobby: FetchLobby,
-  config: { totalRooms: number; filesPerRoom: number }
+  config: { totalRooms: number }
 ): Promise<Response> {
   const url = new URL(req.url);
   const trackName = url.searchParams.get("track_name");
@@ -141,7 +141,6 @@ function handlePostEndpoint(): Response {
 
 const CONFIG = {
   totalRooms: TOTAL_ROOMS,
-  filesPerRoom: FILES_PER_ROOM,
 };
 
 export default {
