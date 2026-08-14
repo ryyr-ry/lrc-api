@@ -242,6 +242,11 @@ def main():
     num_rooms = ((num_rooms + 99) // 100) * 100  # round to nearest 100
     print(f"Estimated rooms: {num_rooms}", flush=True)
 
+    # room_files: { room_index: [ { "name": ..., "size": ..., "track_ids": [...] }, ... ] }
+    room_files = {}  # room_idx -> list of file dicts
+    current_file = {}  # room_idx -> current accumulating file dict
+    current_size = {}  # room_idx -> current file byte size
+
     for i in range(num_rooms):
         room_files[i] = []
         current_file[i] = {
@@ -253,30 +258,6 @@ def main():
         room_files[i].append(current_file[i])
 
     # Now stream all records and build manifest
-    # We assign each record to chunk = hash(artist + track) % num_rooms
-    # Within each chunk, we accumulate into 18 MB files (4 files per room)
-
-    # For manifest, we need to know:
-    # 1. Total number of files
-    # 2. Each file's name and size
-    # 3. Each file's track_id list (for FUSE read)
-
-    # But we can't hold all records in memory. We do it in two sub-passes:
-    # Sub-pass A: Assign records to rooms, record track_ids per room
-    # Sub-pass B: For each room, compute file boundaries
-
-    # Actually, we need to know the JSON size of each record to determine
-    # file boundaries. So we need to compute JSON for each record anyway.
-
-    # Strategy: stream through all records, assign to rooms,
-    # and for each room, accumulate records until 18 MB, then start new file.
-    # We only store track_ids and per-file byte sizes in memory.
-
-    # room_files: { room_index: [ { "name": ..., "size": ..., "track_ids": [...] }, ... ] }
-    room_files = {}  # room_idx -> list of file dicts
-    current_file = {}  # room_idx -> current accumulating file dict
-    current_size = {}  # room_idx -> current file byte size
-
     total_records = 0
     total_json_bytes = 0
 
@@ -294,16 +275,6 @@ def main():
         artist = row[2] or ""
         name = row[1] or ""
         room_idx = chunk_index(artist, name, num_rooms)
-
-        if room_idx not in room_files:
-            room_files[room_idx] = []
-            current_file[room_idx] = {
-                "name": f"chunk-{room_idx}-0.json",
-                "size": JSON_ARRAY_OVERHEAD,
-                "track_ids": [],
-            }
-            current_size[room_idx] = JSON_ARRAY_OVERHEAD
-            room_files[room_idx].append(current_file[room_idx])
 
         record_bytes_in_array = json_bytes + (1 if current_file[room_idx]["track_ids"] else 0)
 
