@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 Generate manifest from LRCLIB SQLite DB via RapidgzipFile + APSW VFS.
-Scans tracks + lyrics, computes JSON chunk sizes, writes manifest.json.
-No disk decompression. Single pass through the DB.
 
-Output: manifest.json with per-file metadata and track_id lists.
+Two-pass sequential scan (no JOIN) to avoid random access through gzip.
+Pass 1: sequential scan of tracks -> build in-memory metadata + lyrics mapping
+Pass 2: sequential scan of lyrics -> merge with track metadata, build JSON, assign to chunks
 """
 
 import os
@@ -12,16 +12,18 @@ import sys
 import json
 import time
 import struct
+import array
 import apsw
 from rapidgzip import RapidgzipFile
 
 GZIP_PATH = sys.argv[1]
 OUTPUT_PATH = sys.argv[2] if len(sys.argv) > 2 else "manifest.json"
 CONFIG_TS_PATH = sys.argv[3] if len(sys.argv) > 3 else "src/config.ts"
-MAX_FILE_SIZE = 18 * 1024 * 1024  # 18 MiB
+MAX_FILE_SIZE = 18 * 1024 * 1024
 FILES_PER_ROOM = 4
-JSON_ARRAY_OVERHEAD = 2  # "[" + "]"
-JSON_SEPARATOR = 1  # "," between items (with separators=(",",":"))
+JSON_ARRAY_OVERHEAD = 2
+KNOWN_TRACK_COUNT = 32254478
+KNOWN_LYRICS_COUNT = 32680034
 
 
 class GzipVFSFile:
@@ -127,8 +129,8 @@ def normalize(text):
     return " ".join(s.split())
 
 
-def chunk_index(artist, track, num_chunks):
-    key = (normalize(artist) + " " + normalize(track)).encode("utf-8")
+def chunk_index_from_normalized(artist_lower, name_lower, num_chunks):
+    key = (artist_lower + " " + name_lower).encode("utf-8")
     h = 0x811c9dc5
     for b in key:
         h ^= b
@@ -136,34 +138,59 @@ def chunk_index(artist, track, num_chunks):
     return h % num_chunks
 
 
-def build_record_json(row):
-    """Build JSON string for a single record and return (json_str, track_id)."""
-    track_id = row[0]
-    name = row[1] or ""
-    artist_name = row[2] or ""
-    album_name = row[3] or ""
-    duration = row[4] if row[4] is not None else 0
-    instrumental = bool(row[5]) if row[5] is not None else False
-    plain_lyrics = row[6]
-    synced_lyrics = row[7]
-    lyricsfile = row[8]
-
-    rec = {
+def build_record_dict(track_id, name, artist, album, duration,
+                       instrumental, plain, synced, lyricsfile,
+                       name_lower, artist_lower, album_lower):
+    return {
         "id": track_id,
         "name": name,
         "trackName": name,
-        "artistName": artist_name,
-        "albumName": album_name,
+        "artistName": artist,
+        "albumName": album,
         "duration": duration,
         "instrumental": instrumental,
-        "plainLyrics": plain_lyrics,
-        "syncedLyrics": synced_lyrics,
+        "plainLyrics": plain,
+        "syncedLyrics": synced,
         "lyricsfile": lyricsfile,
-        "nameLower": normalize(name),
-        "artistNameLower": normalize(artist_name),
-        "albumNameLower": normalize(album_name),
+        "nameLower": name_lower,
+        "artistNameLower": artist_lower,
+        "albumNameLower": album_lower,
     }
-    return json.dumps(rec, ensure_ascii=False, separators=(",", ":")), track_id
+
+
+def record_json_bytes(rec):
+    return len(json.dumps(rec, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def add_to_manifest(rec, json_size, room_files, current_file, current_size, num_rooms):
+    room_idx = chunk_index_from_normalized(
+        rec["artistNameLower"], rec["nameLower"], num_rooms
+    )
+
+    record_bytes_in_array = json_size + (1 if current_file[room_idx]["track_ids"] else 0)
+
+    if current_size[room_idx] + record_bytes_in_array > MAX_FILE_SIZE:
+        file_count = len(room_files[room_idx])
+        if file_count >= FILES_PER_ROOM:
+            current_file[room_idx]["track_ids"].append(rec["id"])
+            current_file[room_idx]["size"] += record_bytes_in_array
+            current_size[room_idx] += record_bytes_in_array
+        else:
+            new_file = {
+                "name": f"chunk-{room_idx}-{file_count}.json",
+                "size": JSON_ARRAY_OVERHEAD,
+                "track_ids": [],
+            }
+            current_file[room_idx] = new_file
+            current_size[room_idx] = JSON_ARRAY_OVERHEAD
+            room_files[room_idx].append(new_file)
+            current_file[room_idx]["track_ids"].append(rec["id"])
+            current_file[room_idx]["size"] += json_size
+            current_size[room_idx] += json_size
+    else:
+        current_file[room_idx]["track_ids"].append(rec["id"])
+        current_file[room_idx]["size"] += record_bytes_in_array
+        current_size[room_idx] += record_bytes_in_array
 
 
 def main():
@@ -191,61 +218,73 @@ def main():
         flags=apsw.SQLITE_OPEN_READONLY | apsw.SQLITE_OPEN_URI,
     )
     cur = conn.cursor()
-
-    # First pass: count tracks to determine chunk count
-    # We know from inspection: 32,254,478 tracks, 32,680,034 lyrics
-    # We need to determine num_chunks based on total JSON size
-    # Strategy: stream through all records, accumulate into chunks
-
-    print("\n=== PASS 1: Scanning tracks + lyrics ===", flush=True)
-    t1 = time.time()
-
-    # We'll do a single JOIN query streaming
-    # tracks.last_lyrics_id -> lyrics.id
-    # This gives us one row per track with its current lyrics
-
-    # First, estimate total JSON size from a sample
-    sample_count = 100
-    sample_size = 0
-    count = 0
-    for row in cur.execute("""
-        SELECT t.id, t.name, t.artist_name, t.album_name, t.duration,
-               l.instrumental,
-               l.plain_lyrics, l.synced_lyrics, l.lyricsfile
-        FROM tracks t
-        LEFT JOIN lyrics l ON t.last_lyrics_id = l.id
-        LIMIT 100
-    """):
-        json_str, _ = build_record_json(row)
-        sample_size += len(json_str.encode("utf-8"))
-        count += 1
-
-    avg_record_size = sample_size / count if count > 0 else 0
-    print(f"Sample: {count} records, avg {avg_record_size:.0f} bytes/record", flush=True)
-
-    # Reset cursor - need a fresh query for full scan
-    # With immutable=1, we can't reset. We need a new connection or
-    # just use the known count from inspection
-    # Actually APSW allows multiple cursors on one connection
     cur2 = conn.cursor()
 
-    # We know from inspection: 32,254,478 tracks
-    # Estimate total JSON size
-    estimated_total = 32254478 * avg_record_size
+    max_track_id = KNOWN_TRACK_COUNT
+    max_lyrics_id = KNOWN_LYRICS_COUNT
+
+    track_names = [None] * (max_track_id + 1)
+    track_artists = [None] * (max_track_id + 1)
+    track_albums = [None] * (max_track_id + 1)
+    track_durations = array.array("d", [0.0] * (max_track_id + 1))
+    track_matched = bytearray(max_track_id + 1)
+
+    lyrics_to_track = {}
+    lyrics_to_tracks_multi = {}
+    null_lyrics_track_ids = []
+
+    print("\n=== PASS 1: Scanning tracks (sequential) ===", flush=True)
+    t1 = time.time()
+    track_count = 0
+    for row in cur.execute(
+        "SELECT id, name, artist_name, album_name, duration, last_lyrics_id FROM tracks ORDER BY id"
+    ):
+        track_id = row[0]
+        if track_id > max_track_id:
+            track_names.extend([None] * (track_id - max_track_id))
+            track_artists.extend([None] * (track_id - max_track_id))
+            track_albums.extend([None] * (track_id - max_track_id))
+            track_durations.extend([0.0] * (track_id - max_track_id))
+            track_matched.extend(bytearray(track_id - max_track_id))
+            max_track_id = track_id
+
+        track_names[track_id] = row[1] or ""
+        track_artists[track_id] = row[2] or ""
+        track_albums[track_id] = row[3] or ""
+        track_durations[track_id] = row[4] if row[4] is not None else 0.0
+        last_lyrics_id = row[5]
+
+        if last_lyrics_id is not None:
+            if last_lyrics_id in lyrics_to_track:
+                existing = lyrics_to_track.pop(last_lyrics_id)
+                lyrics_to_tracks_multi[last_lyrics_id] = [existing, track_id]
+            elif last_lyrics_id in lyrics_to_tracks_multi:
+                lyrics_to_tracks_multi[last_lyrics_id].append(track_id)
+            else:
+                lyrics_to_track[last_lyrics_id] = track_id
+        else:
+            null_lyrics_track_ids.append(track_id)
+
+        track_count += 1
+        if track_count % 500000 == 0:
+            print(f"  tracks: {track_count} ({time.time()-t1:.1f}s)", flush=True)
+
+    print(f"Pass 1 done: {track_count} tracks in {time.time()-t1:.1f}s", flush=True)
+    print(f"  NULL last_lyrics_id: {len(null_lyrics_track_ids)}", flush=True)
+    print(f"  multi-track lyrics: {len(lyrics_to_tracks_multi)}", flush=True)
+
+    avg_record_size = 7253
+    estimated_total = track_count * avg_record_size
     print(f"Estimated total JSON: {estimated_total} ({estimated_total/1073741824:.2f} GiB)", flush=True)
 
-    # Determine num_chunks (each chunk room = 4 files * 18 MB = 72 MiB)
-    # We want each room's total data to be ~72 MiB
-    room_target = 72 * 1024 * 1024  # 72 MiB
+    room_target = 72 * 1024 * 1024
     num_rooms = max(1, int(estimated_total / room_target))
-    # Round up to be safe
-    num_rooms = ((num_rooms + 99) // 100) * 100  # round to nearest 100
+    num_rooms = ((num_rooms + 99) // 100) * 100
     print(f"Estimated rooms: {num_rooms}", flush=True)
 
-    # room_files: { room_index: [ { "name": ..., "size": ..., "track_ids": [...] }, ... ] }
-    room_files = {}  # room_idx -> list of file dicts
-    current_file = {}  # room_idx -> current accumulating file dict
-    current_size = {}  # room_idx -> current file byte size
+    room_files = {}
+    current_file = {}
+    current_size = {}
 
     for i in range(num_rooms):
         room_files[i] = []
@@ -257,67 +296,113 @@ def main():
         current_size[i] = JSON_ARRAY_OVERHEAD
         room_files[i].append(current_file[i])
 
-    # Now stream all records and build manifest
     total_records = 0
     total_json_bytes = 0
 
-    for row in cur2.execute("""
-        SELECT t.id, t.name, t.artist_name, t.album_name, t.duration,
-               l.instrumental,
-               l.plain_lyrics, l.synced_lyrics, l.lyricsfile
-        FROM tracks t
-        LEFT JOIN lyrics l ON t.last_lyrics_id = l.id
-        ORDER BY t.id
-    """):
-        json_str, track_id = build_record_json(row)
-        json_bytes = len(json_str.encode("utf-8"))
-
-        artist = row[2] or ""
-        name = row[1] or ""
-        room_idx = chunk_index(artist, name, num_rooms)
-
-        record_bytes_in_array = json_bytes + (1 if current_file[room_idx]["track_ids"] else 0)
-
-        if current_size[room_idx] + record_bytes_in_array > MAX_FILE_SIZE:
-            file_count = len(room_files[room_idx])
-            if file_count >= FILES_PER_ROOM:
-                current_file[room_idx]["track_ids"].append(track_id)
-                current_file[room_idx]["size"] += record_bytes_in_array
-                current_size[room_idx] += record_bytes_in_array
-            else:
-                new_file = {
-                    "name": f"chunk-{room_idx}-{file_count}.json",
-                    "size": JSON_ARRAY_OVERHEAD,
-                    "track_ids": [],
-                }
-                current_file[room_idx] = new_file
-                current_size[room_idx] = JSON_ARRAY_OVERHEAD
-                room_files[room_idx].append(new_file)
-                current_file[room_idx]["track_ids"].append(track_id)
-                current_file[room_idx]["size"] += json_bytes
-                current_size[room_idx] += json_bytes
-        else:
-            current_file[room_idx]["track_ids"].append(track_id)
-            current_file[room_idx]["size"] += record_bytes_in_array
-            current_size[room_idx] += record_bytes_in_array
-
+    print("\n  Adding NULL-lyrics tracks to manifest...", flush=True)
+    for track_id in null_lyrics_track_ids:
+        name = track_names[track_id]
+        artist = track_artists[track_id]
+        album = track_albums[track_id]
+        duration = track_durations[track_id]
+        name_lower = normalize(name)
+        artist_lower = normalize(artist)
+        album_lower = normalize(album)
+        rec = build_record_dict(
+            track_id, name, artist, album, duration,
+            False, None, None, None,
+            name_lower, artist_lower, album_lower
+        )
+        json_size = record_json_bytes(rec)
+        add_to_manifest(rec, json_size, room_files, current_file, current_size, num_rooms)
         total_records += 1
-        total_json_bytes += json_bytes
+        total_json_bytes += json_size
 
-        if total_records % 200000 == 0:
-            print(f"  scanned: {total_records} ({time.time()-t1:.1f}s)", flush=True)
+    print(f"  NULL-lyrics tracks added: {len(null_lyrics_track_ids)}", flush=True)
 
-    scan_time = time.time() - t1
-    print(f"\nScan done: {total_records} records in {scan_time:.1f}s", flush=True)
+    print("\n=== PASS 2: Scanning lyrics (sequential) ===", flush=True)
+    t2 = time.time()
+    lyrics_count = 0
+    matched_count = 0
+    for row in cur2.execute(
+        "SELECT id, instrumental, plain_lyrics, synced_lyrics, lyricsfile FROM lyrics ORDER BY id"
+    ):
+        lyrics_id = row[0]
+        instrumental = bool(row[1]) if row[1] is not None else False
+        plain_lyrics = row[2]
+        synced_lyrics = row[3]
+        lyricsfile = row[4]
+
+        track_ids = None
+        if lyrics_id in lyrics_to_track:
+            track_ids = [lyrics_to_track[lyrics_id]]
+        elif lyrics_id in lyrics_to_tracks_multi:
+            track_ids = lyrics_to_tracks_multi[lyrics_id]
+
+        if track_ids:
+            for track_id in track_ids:
+                if track_id > max_track_id or track_names[track_id] is None:
+                    continue
+                name = track_names[track_id]
+                artist = track_artists[track_id]
+                album = track_albums[track_id]
+                duration = track_durations[track_id]
+                name_lower = normalize(name)
+                artist_lower = normalize(artist)
+                album_lower = normalize(album)
+                rec = build_record_dict(
+                    track_id, name, artist, album, duration,
+                    instrumental, plain_lyrics, synced_lyrics, lyricsfile,
+                    name_lower, artist_lower, album_lower
+                )
+                json_size = record_json_bytes(rec)
+                add_to_manifest(rec, json_size, room_files, current_file, current_size, num_rooms)
+                track_matched[track_id] = 1
+                total_records += 1
+                total_json_bytes += json_size
+                matched_count += 1
+
+        lyrics_count += 1
+        if lyrics_count % 500000 == 0:
+            print(f"  lyrics: {lyrics_count} ({time.time()-t2:.1f}s)", flush=True)
+
+    print(f"Pass 2 done: {lyrics_count} lyrics in {time.time()-t2:.1f}s", flush=True)
+    print(f"  matched tracks: {matched_count}", flush=True)
+
+    print("\n  Adding unmatched tracks (last_lyrics_id pointing to missing lyrics)...", flush=True)
+    unmatched_count = 0
+    for track_id in range(1, max_track_id + 1):
+        if track_names[track_id] is not None and not track_matched[track_id]:
+            name = track_names[track_id]
+            artist = track_artists[track_id]
+            album = track_albums[track_id]
+            duration = track_durations[track_id]
+            name_lower = normalize(name)
+            artist_lower = normalize(artist)
+            album_lower = normalize(album)
+            rec = build_record_dict(
+                track_id, name, artist, album, duration,
+                False, None, None, None,
+                name_lower, artist_lower, album_lower
+            )
+            json_size = record_json_bytes(rec)
+            add_to_manifest(rec, json_size, room_files, current_file, current_size, num_rooms)
+            total_records += 1
+            total_json_bytes += json_size
+            unmatched_count += 1
+    print(f"  unmatched tracks added: {unmatched_count}", flush=True)
+
+    del track_names, track_artists, track_albums, track_durations
+    del track_matched, lyrics_to_track, lyrics_to_tracks_multi, null_lyrics_track_ids
+
+    print(f"\nTotal records: {total_records}", flush=True)
     print(f"Total JSON: {total_json_bytes} ({total_json_bytes/1073741824:.2f} GiB)", flush=True)
 
-    # Build flat file list
     files = []
     for room_idx in sorted(room_files.keys()):
         for f in room_files[room_idx]:
             files.append(f)
 
-    # Count rooms with more than FILES_PER_ROOM files
     overflow_rooms = sum(1 for r in room_files.values() if len(r) > FILES_PER_ROOM)
 
     manifest = {
@@ -325,27 +410,16 @@ def main():
         "total_json_bytes": total_json_bytes,
         "total_files": len(files),
         "files_per_room": FILES_PER_ROOM,
-        "total_rooms": len(room_files),
+        "total_rooms": num_rooms,
         "num_chunks": num_rooms,
         "max_file_size": MAX_FILE_SIZE,
         "avg_record_size": avg_record_size,
-        "scan_time_s": scan_time,
         "overflow_rooms": overflow_rooms,
         "files": files,
     }
 
     with open(OUTPUT_PATH, "w") as f:
         json.dump(manifest, f, separators=(",", ":"))
-
-    config_path = os.path.join(os.path.dirname(OUTPUT_PATH), "config.json")
-    config = {
-        "totalRooms": len(room_files),
-        "filesPerRoom": FILES_PER_ROOM,
-        "totalFiles": len(files),
-        "numChunks": num_rooms,
-    }
-    with open(config_path, "w") as f:
-        json.dump(config, f, indent=2)
 
     ts_config_dir = os.path.dirname(CONFIG_TS_PATH)
     os.makedirs(ts_config_dir, exist_ok=True)
@@ -357,9 +431,10 @@ def main():
         f.write(f"export const NUM_CHUNKS = {num_rooms};\n")
     print(f"  config.ts written to {CONFIG_TS_PATH}", flush=True)
 
-    print(f"\nManifest: {len(files)} files, {len(room_files)} rooms", flush=True)
+    print(f"\nManifest: {len(files)} files, {num_rooms} rooms", flush=True)
     print(f"Overflow rooms (> {FILES_PER_ROOM} files): {overflow_rooms}", flush=True)
     print(f"Written to {OUTPUT_PATH}", flush=True)
+    print(f"Total time: {time.time()-t0:.1f}s", flush=True)
 
     conn.close()
     gz.close()

@@ -203,41 +203,76 @@ class ChunkVFS(fuse.Operations):
     def _get_file_content(self, name):
         if name in self._cache:
             content = self._cache.pop(name)
-            self._cache[name] = content  # move to end (LRU)
+            self._cache[name] = content
             return content
 
         track_ids = self.track_ids_by_file.get(name)
         if not track_ids:
-            return b""
+            return b"[]"
 
-        cur = self.conn.cursor()
         id_list = ",".join(str(tid) for tid in track_ids)
-        query = f"""
-            SELECT t.id, t.name, t.artist_name, t.album_name, t.duration,
-                   l.instrumental,
-                   l.plain_lyrics, l.synced_lyrics, l.lyricsfile
-            FROM tracks t
-            LEFT JOIN lyrics l ON t.last_lyrics_id = l.id
-            WHERE t.id IN ({id_list})
-            ORDER BY t.id
-        """
+        cur = self.conn.cursor()
+
+        track_data = {}
+        for row in cur.execute(f"""
+            SELECT id, name, artist_name, album_name, duration, last_lyrics_id
+            FROM tracks WHERE id IN ({id_list})
+        """):
+            track_data[row[0]] = {
+                "name": row[1] or "",
+                "artist": row[2] or "",
+                "album": row[3] or "",
+                "duration": row[4] if row[4] is not None else 0,
+                "last_lyrics_id": row[5],
+            }
+
+        lyrics_ids = [td["last_lyrics_id"] for td in track_data.values() if td["last_lyrics_id"] is not None]
+        lyrics_data = {}
+        if lyrics_ids:
+            lid_list = ",".join(str(lid) for lid in lyrics_ids)
+            for row in cur.execute(f"""
+                SELECT id, instrumental, plain_lyrics, synced_lyrics, lyricsfile
+                FROM lyrics WHERE id IN ({lid_list})
+            """):
+                lyrics_data[row[0]] = {
+                    "instrumental": bool(row[1]) if row[1] is not None else False,
+                    "plainLyrics": row[2],
+                    "syncedLyrics": row[3],
+                    "lyricsfile": row[4],
+                }
 
         records = []
-        for row in cur.execute(query):
+        for track_id in track_ids:
+            td = track_data.get(track_id)
+            if not td:
+                continue
+            lid = td["last_lyrics_id"]
+            if lid is not None and lid in lyrics_data:
+                ld = lyrics_data[lid]
+                instrumental = ld["instrumental"]
+                plain = ld["plainLyrics"]
+                synced = ld["syncedLyrics"]
+                lyricsfile = ld["lyricsfile"]
+            else:
+                instrumental = False
+                plain = None
+                synced = None
+                lyricsfile = None
+
             rec = {
-                "id": row[0],
-                "name": row[1] or "",
-                "trackName": row[1] or "",
-                "artistName": row[2] or "",
-                "albumName": row[3] or "",
-                "duration": row[4] if row[4] is not None else 0,
-                "instrumental": bool(row[5]) if row[5] is not None else False,
-                "plainLyrics": row[6],
-                "syncedLyrics": row[7],
-                "lyricsfile": row[8],
-                "nameLower": normalize(row[1] or ""),
-                "artistNameLower": normalize(row[2] or ""),
-                "albumNameLower": normalize(row[3] or ""),
+                "id": track_id,
+                "name": td["name"],
+                "trackName": td["name"],
+                "artistName": td["artist"],
+                "albumName": td["album"],
+                "duration": td["duration"],
+                "instrumental": instrumental,
+                "plainLyrics": plain,
+                "syncedLyrics": synced,
+                "lyricsfile": lyricsfile,
+                "nameLower": normalize(td["name"]),
+                "artistNameLower": normalize(td["artist"]),
+                "albumNameLower": normalize(td["album"]),
             }
             records.append(rec)
 
