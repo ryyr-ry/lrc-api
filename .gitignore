@@ -1,0 +1,4 @@
+node_modules/
+public/
+should_be_gitignored/
+.playwright-mcp/

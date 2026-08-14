@@ -1,0 +1,76 @@
+name: Deploy LRC API
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  DUMP_URL: https://db-dumps.lrclib.net/lrclib-db-dump-20260807T082319Z.sqlite3.gz
+  GZIP_PATH: /tmp/lrclib-db.sqlite3.gz
+  MANIFEST_PATH: /tmp/manifest.json
+  MOUNT_POINT: /tmp/fuse_data
+  PUBLIC_DIR: public/data
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Install FUSE dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libfuse-dev fuse aria2 2>/dev/null || true
+          sudo modprobe fuse 2>/dev/null || true
+          sudo chmod 666 /dev/fuse 2>/dev/null || true
+
+      - name: Install Python dependencies
+        run: |
+          pip install --no-cache-dir rapidgzip apsw mfusepy
+
+      - name: Install Node dependencies
+        run: bun install
+
+      - name: Download DB dump
+        run: |
+          aria2c -x 16 -s 16 -d /tmp -o lrclib-db.sqlite3.gz "$DUMP_URL"
+
+      - name: Generate manifest
+        run: |
+          python scripts/generate_manifest.py "$GZIP_PATH" "$MANIFEST_PATH" "src/config.ts"
+
+      - name: Prepare public directory
+        run: |
+          mkdir -p public
+          rm -rf public/data
+
+      - name: Mount FUSE filesystem
+        run: |
+          mkdir -p "$MOUNT_POINT"
+          python scripts/fuse_vfs.py "$MANIFEST_PATH" "$GZIP_PATH" "$MOUNT_POINT" &
+          FUSE_PID=$!
+          echo "FUSE_PID=$FUSE_PID" >> $GITHUB_ENV
+          sleep 5
+          ls "$MOUNT_POINT" | wc -l
+          echo "FUSE mounted, file count above"
+          ln -s "$MOUNT_POINT" public/data
+
+      - name: Deploy to PartyKit
+        env:
+          PARTYKIT_TOKEN: ${{ secrets.PARTYKIT_TOKEN }}
+        run: |
+          bunx partykit deploy
+
+      - name: Cleanup
+        if: always()
+        run: |
+          if [ -n "$FUSE_PID" ]; then
+            fusermount -u "$MOUNT_POINT" 2>/dev/null || true
+            kill $FUSE_PID 2>/dev/null || true
+          fi
+          rm -f "$GZIP_PATH" "$MANIFEST_PATH"
+          rm -rf "$PUBLIC_DIR"

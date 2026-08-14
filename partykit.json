@@ -1,0 +1,12 @@
+{
+  "name": "partykit-slot-test",
+  "main": "src/server.ts",
+  "serve": { "path": "public" },
+  "crons": {
+    "warm": "*/5 * * * *"
+  },
+  "parties": {
+    "chunk": "src/chunk.ts",
+    "aggregator": "src/aggregator.ts"
+  }
+}
