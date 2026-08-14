@@ -60,8 +60,6 @@ export default class ChunkServer implements Server {
           loaded: this.loaded,
           recordCount: this.records.length,
           loadTimeMs: this.loadTimeMs,
-          approxMemoryMB: Math.round(
-            (JSON.stringify(this.records).length / 1024 / 1024) * 100) / 100,
         }),
         { headers: { "Content-Type": "application/json" } }
       );

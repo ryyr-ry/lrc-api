@@ -214,8 +214,7 @@ class ChunkVFS(fuse.Operations):
         id_list = ",".join(str(tid) for tid in track_ids)
         query = f"""
             SELECT t.id, t.name, t.artist_name, t.album_name, t.duration,
-                   t.last_lyrics_id,
-                   l.instrumental, l.has_lyricsfile,
+                   l.instrumental,
                    l.plain_lyrics, l.synced_lyrics, l.lyricsfile
             FROM tracks t
             LEFT JOIN lyrics l ON t.last_lyrics_id = l.id
@@ -232,17 +231,17 @@ class ChunkVFS(fuse.Operations):
                 "artistName": row[2] or "",
                 "albumName": row[3] or "",
                 "duration": row[4] if row[4] is not None else 0,
-                "instrumental": bool(row[8]) if row[8] is not None else False,
-                "plainLyrics": row[9],
-                "syncedLyrics": row[10],
-                "lyricsfile": row[11],
+                "instrumental": bool(row[5]) if row[5] is not None else False,
+                "plainLyrics": row[6],
+                "syncedLyrics": row[7],
+                "lyricsfile": row[8],
                 "nameLower": normalize(row[1] or ""),
                 "artistNameLower": normalize(row[2] or ""),
                 "albumNameLower": normalize(row[3] or ""),
             }
             records.append(rec)
 
-        content = json.dumps(records, ensure_ascii=False).encode("utf-8")
+        content = json.dumps(records, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
         if len(self._cache) >= self._cache_max:
             oldest = next(iter(self._cache))

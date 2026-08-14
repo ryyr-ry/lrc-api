@@ -20,6 +20,8 @@ OUTPUT_PATH = sys.argv[2] if len(sys.argv) > 2 else "manifest.json"
 CONFIG_TS_PATH = sys.argv[3] if len(sys.argv) > 3 else "src/config.ts"
 MAX_FILE_SIZE = 18 * 1024 * 1024  # 18 MiB
 FILES_PER_ROOM = 4
+JSON_ARRAY_OVERHEAD = 2  # "[" + "]"
+JSON_SEPARATOR = 1  # "," between items (with separators=(",",":"))
 
 
 class GzipVFSFile:
@@ -141,10 +143,10 @@ def build_record_json(row):
     artist_name = row[2] or ""
     album_name = row[3] or ""
     duration = row[4] if row[4] is not None else 0
-    instrumental = bool(row[8]) if row[8] is not None else False
-    plain_lyrics = row[9]
-    synced_lyrics = row[10]
-    lyricsfile = row[11]
+    instrumental = bool(row[5]) if row[5] is not None else False
+    plain_lyrics = row[6]
+    synced_lyrics = row[7]
+    lyricsfile = row[8]
 
     rec = {
         "id": track_id,
@@ -161,7 +163,7 @@ def build_record_json(row):
         "artistNameLower": normalize(artist_name),
         "albumNameLower": normalize(album_name),
     }
-    return json.dumps(rec, ensure_ascii=False), track_id
+    return json.dumps(rec, ensure_ascii=False, separators=(",", ":")), track_id
 
 
 def main():
@@ -208,8 +210,7 @@ def main():
     count = 0
     for row in cur.execute("""
         SELECT t.id, t.name, t.artist_name, t.album_name, t.duration,
-               t.last_lyrics_id,
-               l.instrumental, l.has_lyricsfile,
+               l.instrumental,
                l.plain_lyrics, l.synced_lyrics, l.lyricsfile
         FROM tracks t
         LEFT JOIN lyrics l ON t.last_lyrics_id = l.id
@@ -241,6 +242,16 @@ def main():
     num_rooms = ((num_rooms + 99) // 100) * 100  # round to nearest 100
     print(f"Estimated rooms: {num_rooms}", flush=True)
 
+    for i in range(num_rooms):
+        room_files[i] = []
+        current_file[i] = {
+            "name": f"chunk-{i}-0.json",
+            "size": JSON_ARRAY_OVERHEAD,
+            "track_ids": [],
+        }
+        current_size[i] = JSON_ARRAY_OVERHEAD
+        room_files[i].append(current_file[i])
+
     # Now stream all records and build manifest
     # We assign each record to chunk = hash(artist + track) % num_rooms
     # Within each chunk, we accumulate into 18 MB files (4 files per room)
@@ -271,8 +282,7 @@ def main():
 
     for row in cur2.execute("""
         SELECT t.id, t.name, t.artist_name, t.album_name, t.duration,
-               t.last_lyrics_id,
-               l.instrumental, l.has_lyricsfile,
+               l.instrumental,
                l.plain_lyrics, l.synced_lyrics, l.lyricsfile
         FROM tracks t
         LEFT JOIN lyrics l ON t.last_lyrics_id = l.id
@@ -289,36 +299,36 @@ def main():
             room_files[room_idx] = []
             current_file[room_idx] = {
                 "name": f"chunk-{room_idx}-0.json",
-                "size": 0,
+                "size": JSON_ARRAY_OVERHEAD,
                 "track_ids": [],
             }
-            current_size[room_idx] = 0
+            current_size[room_idx] = JSON_ARRAY_OVERHEAD
             room_files[room_idx].append(current_file[room_idx])
 
-        # Check if current file is full
-        if current_size[room_idx] + json_bytes > MAX_FILE_SIZE:
+        record_bytes_in_array = json_bytes + (1 if current_file[room_idx]["track_ids"] else 0)
+
+        if current_size[room_idx] + record_bytes_in_array > MAX_FILE_SIZE:
             file_count = len(room_files[room_idx])
             if file_count >= FILES_PER_ROOM:
-                # Overflow: force append to last file even if over 18 MB
                 current_file[room_idx]["track_ids"].append(track_id)
-                current_file[room_idx]["size"] += json_bytes
-                current_size[room_idx] += json_bytes
+                current_file[room_idx]["size"] += record_bytes_in_array
+                current_size[room_idx] += record_bytes_in_array
             else:
                 new_file = {
                     "name": f"chunk-{room_idx}-{file_count}.json",
-                    "size": 0,
+                    "size": JSON_ARRAY_OVERHEAD,
                     "track_ids": [],
                 }
                 current_file[room_idx] = new_file
-                current_size[room_idx] = 0
+                current_size[room_idx] = JSON_ARRAY_OVERHEAD
                 room_files[room_idx].append(new_file)
                 current_file[room_idx]["track_ids"].append(track_id)
                 current_file[room_idx]["size"] += json_bytes
                 current_size[room_idx] += json_bytes
         else:
             current_file[room_idx]["track_ids"].append(track_id)
-            current_file[room_idx]["size"] += json_bytes
-            current_size[room_idx] += json_bytes
+            current_file[room_idx]["size"] += record_bytes_in_array
+            current_size[room_idx] += record_bytes_in_array
 
         total_records += 1
         total_json_bytes += json_bytes
@@ -370,7 +380,7 @@ def main():
     os.makedirs(ts_config_dir, exist_ok=True)
     with open(CONFIG_TS_PATH, "w") as f:
         f.write("// AUTO-GENERATED by scripts/generate_manifest.py. Do not edit manually.\n")
-        f.write(f"export const TOTAL_ROOMS = {len(room_files)};\n")
+        f.write(f"export const TOTAL_ROOMS = {num_rooms};\n")
         f.write(f"export const FILES_PER_ROOM = {FILES_PER_ROOM};\n")
         f.write(f"export const TOTAL_FILES = {len(files)};\n")
         f.write(f"export const NUM_CHUNKS = {num_rooms};\n")

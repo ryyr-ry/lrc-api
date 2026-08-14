@@ -54,9 +54,14 @@ jobs:
           python scripts/fuse_vfs.py "$MANIFEST_PATH" "$GZIP_PATH" "$MOUNT_POINT" &
           FUSE_PID=$!
           echo "FUSE_PID=$FUSE_PID" >> $GITHUB_ENV
-          sleep 5
-          ls "$MOUNT_POINT" | wc -l
-          echo "FUSE mounted, file count above"
+          sleep 10
+          FILE_COUNT=$(ls "$MOUNT_POINT" 2>/dev/null | wc -l)
+          echo "FUSE file count: $FILE_COUNT"
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "ERROR: FUSE mount failed, no files visible"
+            kill $FUSE_PID 2>/dev/null || true
+            exit 1
+          fi
           ln -s "$MOUNT_POINT" public/data
 
       - name: Deploy to PartyKit
