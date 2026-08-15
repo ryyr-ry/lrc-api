@@ -66,18 +66,18 @@ jobs:
 
       - name: Create release and upload archives
         run: |
-          cd "$CHUNK_DIR"
           gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
             --title "Chunk archives (auto)" \
             --notes "Auto-generated chunk archives" \
             --prerelease \
-            chunk_archive_*
+            "$CHUNK_DIR"/chunk_archive_*
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload config.ts and manifest as release assets
         run: |
-          gh release upload "$RELEASE_TAG" src/config.ts "$MANIFEST_PATH" --clobber
+          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" src/config.ts "$MANIFEST_PATH" --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
