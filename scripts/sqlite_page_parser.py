@@ -34,6 +34,11 @@ class SQLitePageParser:
         self._sequential_mode = True
         from rapidgzip import RapidgzipFile
         self.gz_seq = RapidgzipFile(self.gz_path, parallelization=os.cpu_count())
+        print("Building index for sequential reader (seek to end)...", flush=True)
+        import time
+        t0 = time.time()
+        self.gz_seq.seek(0, 2)
+        print(f"Sequential reader index built in {time.time()-t0:.1f}s", flush=True)
 
     def _get_seek_handle(self):
         return self.gz
