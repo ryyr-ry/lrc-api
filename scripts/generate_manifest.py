@@ -379,7 +379,7 @@ def main():
                     total_payload_size = cell[7]
                     local_size = cell[8]
                     file_offset = pending_spill_file.tell()
-                    pending_spill_file.write(struct.pack("<IQIII", local_size, rowid, ovfl_page_num, total_payload_size))
+                    pending_spill_file.write(struct.pack("<QIII", rowid, ovfl_page_num, total_payload_size, local_size))
                     pending_spill_file.write(local_payload)
                     pending_overflows.append((rowid, ovfl_page_num, total_payload_size, local_size, file_offset))
                     continue
@@ -492,7 +492,7 @@ def main():
         for (rowid, ovfl_page_num, total_payload_size, local_size, file_offset) in pending_overflows:
             spill_read.seek(file_offset)
             hdr = spill_read.read(20)
-            _, rowid_chk, ovfl_page_num_chk, total_payload_size_chk = struct.unpack("<IQIII", hdr)
+            _rowid_chk, _ovfl_chk, _total_sz_chk, _local_sz_chk = struct.unpack("<QIII", hdr)
             local_payload = spill_read.read(local_size)
 
             payload = bytearray(local_payload)
