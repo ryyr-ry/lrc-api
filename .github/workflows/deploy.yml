@@ -85,14 +85,12 @@ jobs:
 
           gh release delete "$RELEASE_TAG" --yes --cleanup-tag 2>/dev/null || true
 
-          gh release create "$RELEASE_TAG" \
+          UPLOAD_URL=$(gh release create "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --title "Chunk archives (auto)" \
             --notes "Auto-generated chunk archives" \
-            --prerelease --draft
-
-          UPLOAD_URL=$(gh api repos/"$GITHUB_REPOSITORY"/releases/tags/"$RELEASE_TAG" \
-            --jq '.upload_url' | sed 's/{.*}//')
+            --prerelease --draft \
+            --json uploadUrl --jq '.uploadUrl' | sed 's/{.*}//')
 
           i=0
           while IFS= read -r group; do
@@ -109,8 +107,8 @@ jobs:
           done < /tmp/file_groups
           wait
 
-          ASSET_COUNT=$(gh api repos/"$GITHUB_REPOSITORY"/releases/tags/"$RELEASE_TAG" \
-            --jq '.assets | length')
+          ASSET_COUNT=$(gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets | length')
           echo "Assets uploaded: $ASSET_COUNT"
 
           gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
