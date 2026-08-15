@@ -383,7 +383,6 @@ def main():
                     file_offset = pending_spill_file.tell()
                     pending_spill_file.write(struct.pack("<QIII", rowid, ovfl_page_num, total_payload_size, local_size))
                     pending_spill_file.write(local_payload)
-                    pending_spill_file.flush()
                     idx = len(pending_overflows)
                     pending_overflows.append((rowid, ovfl_page_num, total_payload_size, local_size, file_offset, 0))
                     if ovfl_page_num not in pending_by_ovfl_page:

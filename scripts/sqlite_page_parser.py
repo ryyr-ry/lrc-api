@@ -79,7 +79,7 @@ class SQLitePageParser:
             page.extend(self._seq_buf[self._seq_buf_pos:])
             remaining -= len(self._seq_buf) - self._seq_buf_pos
 
-        CHUNK = 4 * 1024 * 1024
+        CHUNK = 16 * 1024 * 1024
         while remaining > 0:
             to_read = max(CHUNK, remaining)
             chunk = self.gz.read(to_read)
