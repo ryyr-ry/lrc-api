@@ -339,12 +339,16 @@ def main():
     tc = 0
     lc = 0
     overflow_seeks = 0
-    page_num = 1
     U = parser.usable_size
     encoding = parser.text_encoding
+    page_size = parser.page_size
+    total_pages = parser.page_count
 
-    while page_num <= parser.page_count:
-        page_data = parser.read_page(page_num)
+    parser.seek_to_beginning()
+
+    page_num = 1
+    while page_num <= total_pages:
+        page_data = parser.read_sequential_page()
         ring_buffer.put(page_num, page_data)
 
         bt_offset = 100 if page_num == 1 else 0

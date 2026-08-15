@@ -19,12 +19,20 @@ class SQLitePageParser:
         from rapidgzip import RapidgzipFile
         self.gz_path = gz_path
         self.gz = RapidgzipFile(gz_path, parallelization=parallelization or os.cpu_count())
+        self.gz_seek = None
         self.page_size = 0
         self.reserved_size = 0
         self.usable_size = 0
         self.page_count = 0
         self.text_encoding = 1
         self._read_header()
+
+    def _get_seek_handle(self):
+        if self.gz_seek is None:
+            from rapidgzip import RapidgzipFile
+            self.gz_seek = RapidgzipFile(self.gz_path, parallelization=os.cpu_count())
+            self.gz_seek.seek(0, 2)
+        return self.gz_seek
 
     def _read_header(self):
         header = self._read_exact(100)
@@ -48,6 +56,12 @@ class SQLitePageParser:
     def build_index(self):
         self.gz.seek(0, 2)
 
+    def seek_to_beginning(self):
+        self.gz.seek(0)
+
+    def read_sequential_page(self) -> bytes:
+        return self._read_exact(self.page_size)
+
     def _read_exact(self, n: int) -> bytes:
         buf = bytearray()
         while len(buf) < n:
@@ -62,7 +76,18 @@ class SQLitePageParser:
 
     def read_page(self, page_num: int) -> bytes:
         offset = (page_num - 1) * self.page_size
-        return self._read_exact_at(offset, self.page_size)
+        fh = self._get_seek_handle()
+        fh.seek(offset)
+        buf = bytearray()
+        remaining = self.page_size
+        while remaining > 0:
+            chunk = fh.read(remaining)
+            if not chunk:
+                buf.extend(b"\x00" * remaining)
+                break
+            buf.extend(chunk)
+            remaining -= len(chunk)
+        return bytes(buf)
 
     def _read_exact_at(self, offset: int, n: int) -> bytes:
         self.gz.seek(offset)
@@ -82,10 +107,12 @@ class SQLitePageParser:
             page_num += 1
 
     def close(self):
-        try:
-            self.gz.close()
-        except Exception:
-            pass
+        for fh in (self.gz, self.gz_seek):
+            if fh is not None:
+                try:
+                    fh.close()
+                except Exception:
+                    pass
 
 
 def decode_varint_inline(data: bytes, offset: int) -> tuple:
@@ -165,18 +192,53 @@ def compute_local_payload_size(payload_size: int, U: int) -> int:
 
 
 def parse_schema(parser: SQLitePageParser) -> dict:
-    page_data = parser.read_page(1)
-    bt_offset = 100
+    entries = _collect_schema_entries(parser, 1, set())
+
+    tables = {}
+    for e in entries:
+        if e["type"] == "table" and e["name"] and not e["name"].startswith("sqlite_"):
+            cols = parse_create_table(e["sql"])
+            tables[e["name"]] = {
+                "rootpage": e["rootpage"],
+                "columns": cols,
+                "ncols": len(cols),
+                "sql": e["sql"],
+            }
+    return tables
+
+
+def _collect_schema_entries(parser: SQLitePageParser, page_num: int, visited: set) -> list:
+    if page_num in visited or page_num < 1:
+        return []
+    visited.add(page_num)
+
+    page_data = parser.read_page(page_num)
+    bt_offset = 100 if page_num == 1 else 0
+
+    if len(page_data) <= bt_offset:
+        return []
+
     page_type = page_data[bt_offset]
 
-    if page_type != 13:
-        raise ValueError(f"Page 1 is not a leaf table page (type={page_type}). Interior pages not yet supported.")
+    if page_type == 13:
+        return _parse_leaf_schema_page(parser, page_data, bt_offset, page_num)
+    elif page_type == 5:
+        return _parse_interior_schema_page(parser, page_data, bt_offset, page_num, visited)
+    else:
+        return []
 
+
+def _parse_leaf_schema_page(parser: SQLitePageParser, page_data: bytes, bt_offset: int, page_num: int) -> list:
     cell_count = struct.unpack(">H", page_data[bt_offset+3:bt_offset+5])[0]
     ptr_array_start = bt_offset + 8
     entries = []
+
     for i in range(cell_count):
+        if ptr_array_start + i*2 + 2 > len(page_data):
+            break
         cell_ptr = struct.unpack(">H", page_data[ptr_array_start + i*2:ptr_array_start + i*2 + 2])[0]
+        if cell_ptr >= len(page_data):
+            continue
         offset = cell_ptr
         payload_size, vsz = decode_varint_inline(page_data, offset)
         offset += vsz
@@ -184,8 +246,12 @@ def parse_schema(parser: SQLitePageParser) -> dict:
         offset += vsz
         U = parser.usable_size
         local_size = compute_local_payload_size(payload_size, U)
+        if offset + local_size > len(page_data):
+            continue
         payload = bytes(page_data[offset:offset+local_size])
         if local_size < payload_size:
+            if offset + local_size + 4 > len(page_data):
+                continue
             ovfl_page = struct.unpack(">I", page_data[offset+local_size:offset+local_size+4])[0]
             full_payload = bytearray(payload)
             remaining = payload_size - local_size
@@ -199,26 +265,37 @@ def parse_schema(parser: SQLitePageParser) -> dict:
             payload = bytes(full_payload)
 
         values = decode_record(payload, parser.text_encoding)
-        entry = {
-            "type": values[0],
-            "name": values[1],
-            "tbl_name": values[2],
-            "rootpage": values[3],
-            "sql": values[4],
-        }
-        entries.append(entry)
+        entries.append({
+            "type": values[0] if len(values) > 0 else None,
+            "name": values[1] if len(values) > 1 else None,
+            "tbl_name": values[2] if len(values) > 2 else None,
+            "rootpage": values[3] if len(values) > 3 else None,
+            "sql": values[4] if len(values) > 4 else None,
+        })
 
-    tables = {}
-    for e in entries:
-        if e["type"] == "table" and e["name"] and not e["name"].startswith("sqlite_"):
-            cols = parse_create_table(e["sql"])
-            tables[e["name"]] = {
-                "rootpage": e["rootpage"],
-                "columns": cols,
-                "ncols": len(cols),
-                "sql": e["sql"],
-            }
-    return tables
+    return entries
+
+
+def _parse_interior_schema_page(parser: SQLitePageParser, page_data: bytes, bt_offset: int, page_num: int, visited: set) -> list:
+    cell_count = struct.unpack(">H", page_data[bt_offset+3:bt_offset+5])[0]
+    ptr_array_start = bt_offset + 12
+
+    right_most_page = struct.unpack(">I", page_data[bt_offset+8:bt_offset+12])[0]
+
+    entries = []
+
+    for i in range(cell_count):
+        if ptr_array_start + i*2 + 2 > len(page_data):
+            break
+        cell_ptr = struct.unpack(">H", page_data[ptr_array_start + i*2:ptr_array_start + i*2 + 2])[0]
+        if cell_ptr + 4 > len(page_data):
+            continue
+        left_child_page = struct.unpack(">I", page_data[cell_ptr:cell_ptr+4])[0]
+        entries.extend(_collect_schema_entries(parser, left_child_page, visited))
+
+    entries.extend(_collect_schema_entries(parser, right_most_page, visited))
+
+    return entries
 
 
 def parse_create_table(sql: str) -> list:
