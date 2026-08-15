@@ -187,11 +187,11 @@ def decode_serial_value(data: bytes, offset: int, st: int, encoding: int) -> tup
     if st >= 13 and st % 2 == 1:
         raw = data[offset:offset+sz]
         if encoding == 1:
-            return (raw.decode("utf-8"), offset + sz)
+            return (raw.decode("utf-8", errors="replace"), offset + sz)
         elif encoding == 2:
-            return (raw.decode("utf-16-le"), offset + sz)
+            return (raw.decode("utf-16-le", errors="replace"), offset + sz)
         elif encoding == 3:
-            return (raw.decode("utf-16-be"), offset + sz)
+            return (raw.decode("utf-16-be", errors="replace"), offset + sz)
         return (raw, offset + sz)
     if st >= 12 and st % 2 == 0:
         return (data[offset:offset+sz], offset + sz)

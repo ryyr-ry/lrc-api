@@ -337,6 +337,7 @@ def main():
     pending_by_ovfl_page = {}
     PENDING_SPILL_PATH = "/tmp/pending_overflows.bin"
     pending_spill_file = open(PENDING_SPILL_PATH, "wb")
+    pending_spill_read = None
 
     parser.enable_sequential_mode()
 
@@ -382,6 +383,7 @@ def main():
                     file_offset = pending_spill_file.tell()
                     pending_spill_file.write(struct.pack("<QIII", rowid, ovfl_page_num, total_payload_size, local_size))
                     pending_spill_file.write(local_payload)
+                    pending_spill_file.flush()
                     idx = len(pending_overflows)
                     pending_overflows.append((rowid, ovfl_page_num, total_payload_size, local_size, file_offset, 0))
                     if ovfl_page_num not in pending_by_ovfl_page:
@@ -472,14 +474,16 @@ def main():
                         print(f"  lyrics: {lc} ({time.time()-t1:.1f}s)", flush=True)
 
         if page_num in pending_by_ovfl_page:
+            if pending_spill_read is None:
+                pending_spill_read = open(PENDING_SPILL_PATH, "rb")
             for idx in pending_by_ovfl_page[page_num]:
                 rowid, ovfl_page_num, total_payload_size, local_size, file_offset, status = pending_overflows[idx]
                 if status == 1:
                     continue
-                pending_spill_file.seek(file_offset)
-                hdr = pending_spill_file.read(20)
+                pending_spill_read.seek(file_offset)
+                hdr = pending_spill_read.read(20)
                 _r, _o, _t, _l = struct.unpack("<QIII", hdr)
-                local_payload = pending_spill_file.read(local_size)
+                local_payload = pending_spill_read.read(local_size)
                 payload = bytearray(local_payload)
                 remaining = total_payload_size - local_size
                 current_ovfl = ovfl_page_num
@@ -588,6 +592,8 @@ def main():
 
     lyrics_temp_file.close()
     pending_spill_file.close()
+    if pending_spill_read is not None:
+        pending_spill_read.close()
     parser.close()
 
     print(f"  lyrics temp file: {lyrics_temp_offset} bytes ({lyrics_temp_offset/1073741824:.2f} GiB)", flush=True)
@@ -601,6 +607,7 @@ def main():
         page_size_fix = page_size
         U_fix = U
         spill_read = open(PENDING_SPILL_PATH, "rb")
+        lyrics_temp_file2 = open(LYRICS_TEMP_PATH, "ab")
         resolved = 0
         for (rowid, ovfl_page_num, total_payload_size, local_size, file_offset, _status) in unresolved:
             spill_read.seek(file_offset)
@@ -689,13 +696,12 @@ def main():
                 compressed = lyrics_zctx.compress(bytes(rec_bytes))
                 lyrics_offset[lid] = lyrics_temp_offset
                 lyrics_compressed_len[lid] = len(compressed)
-                lyrics_temp_file2 = open(LYRICS_TEMP_PATH, "ab")
                 lyrics_temp_file2.write(compressed)
-                lyrics_temp_file2.close()
                 lyrics_temp_offset += len(compressed)
                 lc += 1
                 resolved += 1
 
+        lyrics_temp_file2.close()
         print(f"  Resolved {resolved}/{len(unresolved)} in {time.time()-t_ov:.1f}s", flush=True)
         gz_fix.close()
         spill_read.close()
@@ -756,9 +762,9 @@ def main():
         decompressed = lyrics_zdctx.decompress(compressed_chunk)
 
         parts = decompressed.split(b"\x00")
-        plain = parts[0].decode("utf-8") if parts[0] else None
-        synced = parts[1].decode("utf-8") if len(parts) > 1 and parts[1] else None
-        lfile = parts[2].decode("utf-8") if len(parts) > 2 and parts[2] else None
+        plain = parts[0].decode("utf-8", errors="replace") if parts[0] else None
+        synced = parts[1].decode("utf-8", errors="replace") if len(parts) > 1 and parts[1] else None
+        lfile = parts[2].decode("utf-8", errors="replace") if len(parts) > 2 and parts[2] else None
         instrumental = bool(lyrics_instrumental[lid])
 
         tid = lyrics_first[lid] if lid < len(lyrics_first) else 0
