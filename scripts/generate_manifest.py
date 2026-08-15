@@ -334,6 +334,7 @@ def main():
 
     ring_buffer = RingBuffer(capacity=8192)
     pending_overflows = []
+    pending_by_ovfl_page = {}
     PENDING_SPILL_PATH = "/tmp/pending_overflows.bin"
     pending_spill_file = open(PENDING_SPILL_PATH, "wb")
 
@@ -381,7 +382,11 @@ def main():
                     file_offset = pending_spill_file.tell()
                     pending_spill_file.write(struct.pack("<QIII", rowid, ovfl_page_num, total_payload_size, local_size))
                     pending_spill_file.write(local_payload)
-                    pending_overflows.append((rowid, ovfl_page_num, total_payload_size, local_size, file_offset))
+                    idx = len(pending_overflows)
+                    pending_overflows.append((rowid, ovfl_page_num, total_payload_size, local_size, file_offset, 0))
+                    if ovfl_page_num not in pending_by_ovfl_page:
+                        pending_by_ovfl_page[ovfl_page_num] = []
+                    pending_by_ovfl_page[ovfl_page_num].append(idx)
                     continue
 
                 rowid, ncols, serial_types, payload, header_length, _ = cell[:6]
@@ -466,12 +471,120 @@ def main():
                     if lc % 1000000 == 0:
                         print(f"  lyrics: {lc} ({time.time()-t1:.1f}s)", flush=True)
 
+        if page_num in pending_by_ovfl_page:
+            for idx in pending_by_ovfl_page[page_num]:
+                rowid, ovfl_page_num, total_payload_size, local_size, file_offset, status = pending_overflows[idx]
+                if status == 1:
+                    continue
+                pending_spill_file.seek(file_offset)
+                hdr = pending_spill_file.read(20)
+                _r, _o, _t, _l = struct.unpack("<QIII", hdr)
+                local_payload = pending_spill_file.read(local_size)
+                payload = bytearray(local_payload)
+                remaining = total_payload_size - local_size
+                current_ovfl = ovfl_page_num
+                chain_ok = True
+                while current_ovfl != 0 and remaining > 0:
+                    if current_ovfl in ring_buffer:
+                        ovfl_data = ring_buffer[current_ovfl]
+                    elif current_ovfl == page_num:
+                        ovfl_data = page_data
+                    else:
+                        chain_ok = False
+                        break
+                    next_page = struct.unpack(">I", ovfl_data[0:4])[0]
+                    chunk = min(remaining, U - 4)
+                    payload.extend(ovfl_data[4:4+chunk])
+                    remaining -= chunk
+                    current_ovfl = next_page
+                if chain_ok and remaining <= 0:
+                    payload = bytes(payload)
+                    header_length, hvsz = decode_varint_inline(payload, 0)
+                    h_off = hvsz
+                    serial_types = []
+                    ncols = 0
+                    while h_off < header_length:
+                        st, stvsz = decode_varint_inline(payload, h_off)
+                        serial_types.append(st)
+                        h_off += stvsz
+                        ncols += 1
+                    table = classify_record(ncols, serial_types, tracks_ncols, lyrics_ncols)
+                    if table == "tracks":
+                        tid = rowid
+                        if tid > max_tid:
+                            ext = tid - max_tid
+                            str_offsets.extend([0] * ext)
+                            str_lens.extend([0] * ext)
+                            durations.extend([0.0] * ext)
+                            room_indices.extend([0] * ext)
+                            matched.extend(bytearray(ext))
+                            next_track.extend([0] * ext)
+                            max_tid = tid
+                        if str_lens[tid] > 0:
+                            pending_overflows[idx] = (rowid, ovfl_page_num, total_payload_size, local_size, file_offset, 1)
+                            continue
+                        name, artist, album, dur, last_lid = decode_tracks_record(
+                            payload, header_length, encoding, tracks_col_names
+                        )
+                        entry = name.encode("utf-8") + SEP + artist.encode("utf-8") + SEP + album.encode("utf-8")
+                        str_offsets[tid] = len(string_data)
+                        string_data.extend(entry)
+                        str_lens[tid] = len(entry)
+                        durations[tid] = dur
+                        nl = _normalize(name)
+                        al = _normalize(artist)
+                        room_indices[tid] = _fnv((al + " " + nl).encode("utf-8")) % num_rooms
+                        if last_lid is not None:
+                            if last_lid >= len(lyrics_first):
+                                lyrics_first.extend([0] * (last_lid - len(lyrics_first) + 1))
+                            next_track[tid] = lyrics_first[last_lid]
+                            lyrics_first[last_lid] = tid
+                        else:
+                            null_ids.append(tid)
+                        tc += 1
+                        pending_overflows[idx] = (rowid, ovfl_page_num, total_payload_size, local_size, file_offset, 1)
+                    elif table == "lyrics":
+                        lid = rowid
+                        if lid >= len(lyrics_offset):
+                            ext = lid - len(lyrics_offset) + 1
+                            lyrics_offset.extend([0] * ext)
+                            lyrics_compressed_len.extend([0] * ext)
+                            lyrics_instrumental.extend(bytearray(ext))
+                        if lid >= len(lyrics_first):
+                            ext = lid - len(lyrics_first) + 1
+                            lyrics_first.extend([0] * ext)
+                        if lyrics_compressed_len[lid] > 0:
+                            pending_overflows[idx] = (rowid, ovfl_page_num, total_payload_size, local_size, file_offset, 1)
+                            continue
+                        plain, synced, lfile, instrumental = decode_lyrics_record(
+                            payload, header_length, encoding, lyrics_col_names
+                        )
+                        lyrics_instrumental[lid] = 1 if instrumental else 0
+                        rec_bytes = bytearray()
+                        if plain is not None:
+                            rec_bytes.extend(str(plain).encode("utf-8"))
+                        rec_bytes.append(0x00)
+                        if synced is not None:
+                            rec_bytes.extend(str(synced).encode("utf-8"))
+                        rec_bytes.append(0x00)
+                        if lfile is not None:
+                            rec_bytes.extend(str(lfile).encode("utf-8"))
+                        rec_bytes.append(0x00)
+                        compressed = lyrics_zctx.compress(bytes(rec_bytes))
+                        lyrics_offset[lid] = lyrics_temp_offset
+                        lyrics_compressed_len[lid] = len(compressed)
+                        lyrics_temp_file.write(compressed)
+                        lyrics_temp_offset += len(compressed)
+                        lc += 1
+                        pending_overflows[idx] = (rowid, ovfl_page_num, total_payload_size, local_size, file_offset, 1)
+
         page_num += 1
         if page_num % 100000 == 0:
             print(f"  pages: {page_num}/{parser.page_count} ({time.time()-t1:.1f}s)", flush=True)
 
     print(f"Scan done: {tc} tracks, {lc} lyrics in {time.time()-t1:.1f}s", flush=True)
-    print(f"  Pending overflows: {len(pending_overflows)}", flush=True)
+    unresolved = [po for po in pending_overflows if po[5] == 0]
+    print(f"  Pending overflows: {len(pending_overflows)} (resolved in-pass: {len(pending_overflows) - len(unresolved)}, unresolved: {len(unresolved)})", flush=True)
 
     lyrics_temp_file.close()
     pending_spill_file.close()
@@ -479,8 +592,8 @@ def main():
 
     print(f"  lyrics temp file: {lyrics_temp_offset} bytes ({lyrics_temp_offset/1073741824:.2f} GiB)", flush=True)
 
-    if pending_overflows:
-        print(f"\n=== Pass 2: Resolving {len(pending_overflows)} pending overflows ===", flush=True)
+    if unresolved:
+        print(f"\n=== Pass 2: Resolving {len(unresolved)} unresolved overflows via seek ===", flush=True)
         t_ov = time.time()
         from rapidgzip import RapidgzipFile
         gz_fix = RapidgzipFile(GZIP_PATH, parallelization=os.cpu_count())
@@ -489,10 +602,10 @@ def main():
         U_fix = U
         spill_read = open(PENDING_SPILL_PATH, "rb")
         resolved = 0
-        for (rowid, ovfl_page_num, total_payload_size, local_size, file_offset) in pending_overflows:
+        for (rowid, ovfl_page_num, total_payload_size, local_size, file_offset, _status) in unresolved:
             spill_read.seek(file_offset)
             hdr = spill_read.read(20)
-            _rowid_chk, _ovfl_chk, _total_sz_chk, _local_sz_chk = struct.unpack("<QIII", hdr)
+            _r, _o, _t, _l = struct.unpack("<QIII", hdr)
             local_payload = spill_read.read(local_size)
 
             payload = bytearray(local_payload)
@@ -583,10 +696,11 @@ def main():
                 lc += 1
                 resolved += 1
 
-        print(f"  Resolved {resolved}/{len(pending_overflows)} in {time.time()-t_ov:.1f}s", flush=True)
+        print(f"  Resolved {resolved}/{len(unresolved)} in {time.time()-t_ov:.1f}s", flush=True)
         gz_fix.close()
         spill_read.close()
         del pending_overflows
+        del unresolved
         os.remove(PENDING_SPILL_PATH)
 
     print("\n=== Writing null-lyrics tracks ===", flush=True)
