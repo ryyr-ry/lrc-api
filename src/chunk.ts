@@ -1,6 +1,5 @@
 import type { LyricRecord } from "./types";
 import { prepareInput, toApiResponse, DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT } from "./types";
-import { FILES_PER_ROOM } from "./config";
 import type { Request as PartyRequest, Room, Server } from "partykit/server";
 
 export default class ChunkServer implements Server {
@@ -11,7 +10,8 @@ export default class ChunkServer implements Server {
   chunkIndex = -1;
 
   private lruCache = new Map<string, string>();
-  private readonly LRU_MAX = 200;
+  private readonly LRU_MAX_BYTES = 20 * 1024 * 1024;
+  private lruCacheBytes = 0;
 
   private inflight = new Map<string, Promise<string>>();
 
@@ -27,7 +27,7 @@ export default class ChunkServer implements Server {
     }
 
     const t0 = Date.now();
-    for (let part = 0; part < FILES_PER_ROOM; part++) {
+    for (let part = 0; ; part++) {
       const path = `/data/chunk-${this.chunkIndex}-${part}.json`;
       try {
         const res = await this.room.context.assets.fetch(path);
@@ -97,19 +97,28 @@ export default class ChunkServer implements Server {
     const artistNameLower = prepareInput(artistName);
     const duration = durationStr ? parseFloat(durationStr) : null;
 
+    let best: LyricRecord | null = null;
+
+    const albumLower = albumName ? prepareInput(albumName) : null;
+
     for (const rec of this.records) {
       if (rec.nameLower === nameLower && rec.artistNameLower === artistNameLower) {
         if (duration !== null) {
           if (rec.duration < duration - 2.0 || rec.duration > duration + 2.0) continue;
         }
-        if (albumName) {
-          const albumLower = prepareInput(albumName);
+        if (albumLower !== null) {
           if (rec.albumNameLower !== albumLower) continue;
         }
-        return new Response(JSON.stringify(toApiResponse(rec)), {
-          headers: { "Content-Type": "application/json" },
-        });
+        if (best === null || rec.id < best.id) {
+          best = rec;
+        }
       }
+    }
+
+    if (best !== null) {
+      return new Response(JSON.stringify(toApiResponse(best)), {
+        headers: { "Content-Type": "application/json" },
+      });
     }
 
     return new Response(
@@ -184,7 +193,7 @@ export default class ChunkServer implements Server {
     albumName: string | null,
     limit: number
   ): Promise<string> {
-    const results: ReturnType<typeof toApiResponse>[] = [];
+    const matched: LyricRecord[] = [];
 
     if (q) {
       const tokens = prepareInput(q).split(" ").filter(t => t.length > 0);
@@ -194,8 +203,7 @@ export default class ChunkServer implements Server {
           rec.artistNameLower.includes(t) ||
           rec.albumNameLower.includes(t)
         )) {
-          results.push(toApiResponse(rec));
-          if (results.length >= limit) break;
+          matched.push(rec);
         }
       }
     } else {
@@ -207,12 +215,13 @@ export default class ChunkServer implements Server {
         if (trackLower && !rec.nameLower.includes(trackLower)) continue;
         if (artistLower && !rec.artistNameLower.includes(artistLower)) continue;
         if (albumLower && !rec.albumNameLower.includes(albumLower)) continue;
-        results.push(toApiResponse(rec));
-        if (results.length >= limit) break;
+        matched.push(rec);
       }
     }
 
-    return JSON.stringify(results);
+    matched.sort((a, b) => a.id - b.id);
+    const sliced = matched.slice(0, limit);
+    return JSON.stringify(sliced.map(rec => toApiResponse(rec)));
   }
 
   private async handleSearchLyrics(url: URL): Promise<Response> {
@@ -249,18 +258,19 @@ export default class ChunkServer implements Server {
 
   private async doSearchLyrics(q: string, limit: number): Promise<string> {
     const queryLower = q.toLowerCase();
-    const results: ReturnType<typeof toApiResponse>[] = [];
+    const matched: LyricRecord[] = [];
 
     for (const rec of this.records) {
       const plain = rec.plainLyrics?.toLowerCase() || "";
       const synced = rec.syncedLyrics?.toLowerCase() || "";
       if (plain.includes(queryLower) || synced.includes(queryLower)) {
-        results.push(toApiResponse(rec));
-        if (results.length >= limit) break;
+        matched.push(rec);
       }
     }
 
-    return JSON.stringify(results);
+    matched.sort((a, b) => a.id - b.id);
+    const sliced = matched.slice(0, limit);
+    return JSON.stringify(sliced.map(rec => toApiResponse(rec)));
   }
 
   private getCached(key: string): string | undefined {
@@ -273,10 +283,20 @@ export default class ChunkServer implements Server {
   }
 
   private setCached(key: string, value: string): void {
-    if (this.lruCache.size >= this.LRU_MAX) {
-      const oldest = this.lruCache.keys().next().value;
-      if (oldest !== undefined) this.lruCache.delete(oldest);
+    const entryBytes = key.length + value.length;
+    const existing = this.lruCache.get(key);
+    if (existing !== undefined) {
+      this.lruCacheBytes -= key.length + existing.length;
     }
     this.lruCache.set(key, value);
+    this.lruCacheBytes += entryBytes;
+    while (this.lruCacheBytes > this.LRU_MAX_BYTES && this.lruCache.size > 0) {
+      const oldest = this.lruCache.keys().next().value;
+      if (oldest !== undefined) {
+        const oldVal = this.lruCache.get(oldest);
+        this.lruCacheBytes -= oldest.length + (oldVal?.length || 0);
+        this.lruCache.delete(oldest);
+      }
+    }
   }
 }

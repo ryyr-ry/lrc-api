@@ -13,12 +13,6 @@ import time
 import stat
 import errno
 
-try:
-    import orjson
-    HAVE_ORJSON = True
-except ImportError:
-    HAVE_ORJSON = False
-
 import zstandard
 import mfusepy as fuse
 
@@ -27,12 +21,6 @@ CHUNK_DIR = sys.argv[2]
 MOUNT_POINT = sys.argv[3]
 
 FUSE_MAX_READ = 128 * 1024
-
-
-def loads_json(data):
-    if HAVE_ORJSON:
-        return orjson.loads(data)
-    return json.loads(data)
 
 
 class ChunkVFS(fuse.Operations):
@@ -102,12 +90,6 @@ class ChunkVFS(fuse.Operations):
         return content
 
     @fuse.overrides(fuse.Operations)
-    def init_with_config(self, conn_info, config_3):
-        if conn_info is not None:
-            conn_info.max_read = FUSE_MAX_READ
-            conn_info.max_write = FUSE_MAX_READ
-
-    @fuse.overrides(fuse.Operations)
     def getattr(self, path, fh=None):
         if path == "/":
             return self.root_stat
@@ -154,7 +136,7 @@ def main():
     print(f"Chunk dir: {CHUNK_DIR}", flush=True)
 
     fs = ChunkVFS(MANIFEST_PATH, CHUNK_DIR)
-    fuse.FUSE(fs, MOUNT_POINT, foreground=True, nothreads=True)
+    fuse.FUSE(fs, MOUNT_POINT, foreground=True, nothreads=True, max_read=131072)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 import { hashPartition, MAX_SEARCH_LIMIT } from "./types";
-import { TOTAL_ROOMS, NUM_SUPERS } from "./config";
+import { TOTAL_ROOMS, NUM_SUPERS, NUM_AGGREGATORS } from "./config";
 import type { Request as PartyRequest, FetchLobby, Cron, CronLobby, PartyKitServer } from "partykit/server";
 import type { ExecutionContext as CFExecutionContext } from "@cloudflare/workers-types";
 
@@ -59,8 +59,7 @@ async function handleApiGet(
 
 async function handleApiGetById(
   req: PartyRequest,
-  lobby: FetchLobby,
-  config: { totalRooms: number }
+  lobby: FetchLobby
 ): Promise<Response> {
   const url = new URL(req.url);
   const idMatch = url.pathname.match(/^\/api\/get\/(\d+)$/);
@@ -72,9 +71,18 @@ async function handleApiGetById(
     return errorResponse(400, "BadRequest", "Invalid track ID");
   }
 
-  const superId = getSuperId(String(id));
-  const superStub = lobby.parties.aggregator.get(superId);
-  return superStub.fetch(`/get-by-id?id=${id}`);
+  const indexStub = lobby.parties.index.get("index-0");
+  const indexRes = await indexStub.fetch(`/lookup?id=${id}`);
+  if (!indexRes.ok) {
+    return errorResponse(404, "TrackNotFound", "Failed to find specified track");
+  }
+  const indexData = await indexRes.json() as { chunk: number };
+  const chunkIdx = indexData.chunk;
+  if (typeof chunkIdx !== "number" || isNaN(chunkIdx) || chunkIdx < 0) {
+    return errorResponse(404, "TrackNotFound", "Failed to find specified track");
+  }
+  const chunkStub = lobby.parties.chunk.get(`chunk-${chunkIdx}`);
+  return chunkStub.fetch(`/get-by-id?id=${id}`);
 }
 
 async function handleApiSearch(
@@ -158,7 +166,14 @@ export default {
     }
 
     if (path.match(/^\/api\/get\/\d+$/) && req.method === "GET") {
-      return handleApiGetById(req, lobby, CONFIG);
+      const cacheKey = new Request(req.url, req);
+      const cached = await caches.default.match(cacheKey);
+      if (cached) return cached;
+      const res = await handleApiGetById(req, lobby);
+      if (res.status === 200) {
+        ctx.waitUntil(caches.default.put(cacheKey, res.clone()));
+      }
+      return res;
     }
 
     if (path === "/api/search" && req.method === "GET") {
@@ -196,8 +211,9 @@ export default {
 
   async onCron(cron: Cron, lobby: CronLobby): Promise<void> {
     if (cron.name !== "warm") return;
-    const chunkParty = lobby.parties.chunk;
     const batchSize = 6;
+
+    const chunkParty = lobby.parties.chunk;
     for (let i = 0; i < CONFIG.totalRooms; i += batchSize) {
       const batch: Promise<Response>[] = [];
       for (let j = i; j < Math.min(i + batchSize, CONFIG.totalRooms); j++) {
@@ -205,5 +221,22 @@ export default {
       }
       await Promise.all(batch);
     }
+
+    const aggParty = lobby.parties.aggregator;
+    const totalAgg = NUM_SUPERS + NUM_AGGREGATORS;
+    for (let i = 0; i < totalAgg; i += batchSize) {
+      const batch: Promise<Response>[] = [];
+      for (let j = i; j < Math.min(i + batchSize, totalAgg); j++) {
+        if (j < NUM_SUPERS) {
+          batch.push(aggParty.get(`super-${j}`).fetch("/warm"));
+        } else {
+          batch.push(aggParty.get(`agg-${j - NUM_SUPERS}`).fetch("/warm"));
+        }
+      }
+      await Promise.all(batch);
+    }
+
+    const indexParty = lobby.parties.index;
+    await indexParty.get("index-0").fetch("/warm");
   },
 } satisfies PartyKitServer;

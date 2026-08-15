@@ -16,8 +16,8 @@ export default class AggregatorServer implements Server {
     const path = url.pathname;
     const isSuper = this.room.id.startsWith("super-");
 
-    if (path === "/get-by-id") {
-      return this.handleGetById(url, isSuper);
+    if (path === "/warm") {
+      return new Response("OK", { status: 200 });
     }
 
     if (path === "/search") {
@@ -32,71 +32,6 @@ export default class AggregatorServer implements Server {
       status: 404,
       headers: { "Content-Type": "application/json" },
     });
-  }
-
-  private async handleGetById(url: URL, isSuper: boolean): Promise<Response> {
-    const idStr = url.searchParams.get("id");
-    if (!idStr) {
-      return this.jsonError("id required", 400);
-    }
-    const id = parseInt(idStr, 10);
-    if (isNaN(id) || id < 1) {
-      return this.jsonError("invalid id", 400);
-    }
-
-    if (isSuper) {
-      const aggParty = this.room.context.parties.aggregator;
-      const batchSize = 6;
-      for (let i = 0; i < NUM_AGGREGATORS; i += batchSize) {
-        const batch: Promise<Response>[] = [];
-        for (let j = i; j < Math.min(i + batchSize, NUM_AGGREGATORS); j++) {
-          batch.push(aggParty.get(`agg-${j}`).fetch(`/get-by-id?id=${id}`));
-        }
-        const responses = await Promise.all(batch);
-        for (const res of responses) {
-          if (res.ok) {
-            const text = await res.text();
-            try {
-              const item = JSON.parse(text);
-              if (item && !item.error && !item.code) {
-                return new Response(text, {
-                  headers: { "Content-Type": "application/json" },
-                });
-              }
-            } catch {}
-          }
-        }
-      }
-      return this.trackNotFound();
-    } else {
-      const aggIndex = parseInt(this.room.id.replace("agg-", ""), 10);
-      if (isNaN(aggIndex)) return this.trackNotFound();
-      const start = aggIndex * CHUNKS_PER_AGG;
-      const end = Math.min(start + CHUNKS_PER_AGG, TOTAL_ROOMS);
-      const chunkParty = this.room.context.parties.chunk;
-      const batchSize = 6;
-      for (let i = start; i < end; i += batchSize) {
-        const batch: Promise<Response>[] = [];
-        for (let j = i; j < Math.min(i + batchSize, end); j++) {
-          batch.push(chunkParty.get(`chunk-${j}`).fetch(`/get-by-id?id=${id}`));
-        }
-        const responses = await Promise.all(batch);
-        for (const res of responses) {
-          if (res.ok) {
-            const text = await res.text();
-            try {
-              const item = JSON.parse(text);
-              if (item && !item.error && !item.code) {
-                return new Response(text, {
-                  headers: { "Content-Type": "application/json" },
-                });
-              }
-            } catch {}
-          }
-        }
-      }
-      return this.trackNotFound();
-    }
   }
 
   private async handleSearch(url: URL, isSuper: boolean): Promise<Response> {
@@ -119,6 +54,7 @@ export default class AggregatorServer implements Server {
       const aggParty = this.room.context.parties.aggregator;
       const batchSize = 6;
       const allResults: ApiResponse[] = [];
+      let chunkErrors = 0;
 
       for (let i = 0; i < NUM_AGGREGATORS; i += batchSize) {
         const batch: Promise<Response>[] = [];
@@ -137,14 +73,18 @@ export default class AggregatorServer implements Server {
                 }
               } catch {}
             }
+          } else {
+            chunkErrors++;
           }
         }
       }
 
       allResults.sort((a, b) => a.id - b.id);
-      return new Response(JSON.stringify(allResults.slice(0, limit)), {
-        headers: { "Content-Type": "application/json" },
-      });
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (chunkErrors > 0) {
+        headers["X-Chunk-Errors"] = String(chunkErrors);
+      }
+      return new Response(JSON.stringify(allResults.slice(0, limit)), { headers });
     } else {
       const aggIndex = parseInt(this.room.id.replace("agg-", ""), 10);
       if (isNaN(aggIndex)) {
@@ -157,6 +97,7 @@ export default class AggregatorServer implements Server {
       const chunkParty = this.room.context.parties.chunk;
       const batchSize = 6;
       const allResults: ApiResponse[] = [];
+      let chunkErrors = 0;
 
       for (let i = start; i < end; i += batchSize) {
         const batch: Promise<Response>[] = [];
@@ -175,14 +116,18 @@ export default class AggregatorServer implements Server {
                 }
               } catch {}
             }
+          } else {
+            chunkErrors++;
           }
         }
       }
 
       allResults.sort((a, b) => a.id - b.id);
-      return new Response(JSON.stringify(allResults.slice(0, limit)), {
-        headers: { "Content-Type": "application/json" },
-      });
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (chunkErrors > 0) {
+        headers["X-Chunk-Errors"] = String(chunkErrors);
+      }
+      return new Response(JSON.stringify(allResults.slice(0, limit)), { headers });
     }
   }
 
@@ -203,6 +148,7 @@ export default class AggregatorServer implements Server {
       const aggParty = this.room.context.parties.aggregator;
       const batchSize = 6;
       const allResults: ApiResponse[] = [];
+      let chunkErrors = 0;
 
       for (let i = 0; i < NUM_AGGREGATORS; i += batchSize) {
         const batch: Promise<Response>[] = [];
@@ -221,14 +167,18 @@ export default class AggregatorServer implements Server {
                 }
               } catch {}
             }
+          } else {
+            chunkErrors++;
           }
         }
       }
 
       allResults.sort((a, b) => a.id - b.id);
-      return new Response(JSON.stringify(allResults.slice(0, limit)), {
-        headers: { "Content-Type": "application/json" },
-      });
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (chunkErrors > 0) {
+        headers["X-Chunk-Errors"] = String(chunkErrors);
+      }
+      return new Response(JSON.stringify(allResults.slice(0, limit)), { headers });
     } else {
       const aggIndex = parseInt(this.room.id.replace("agg-", ""), 10);
       if (isNaN(aggIndex)) {
@@ -241,6 +191,7 @@ export default class AggregatorServer implements Server {
       const chunkParty = this.room.context.parties.chunk;
       const batchSize = 6;
       const allResults: ApiResponse[] = [];
+      let chunkErrors = 0;
 
       for (let i = start; i < end; i += batchSize) {
         const batch: Promise<Response>[] = [];
@@ -259,28 +210,18 @@ export default class AggregatorServer implements Server {
                 }
               } catch {}
             }
+          } else {
+            chunkErrors++;
           }
         }
       }
 
       allResults.sort((a, b) => a.id - b.id);
-      return new Response(JSON.stringify(allResults.slice(0, limit)), {
-        headers: { "Content-Type": "application/json" },
-      });
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (chunkErrors > 0) {
+        headers["X-Chunk-Errors"] = String(chunkErrors);
+      }
+      return new Response(JSON.stringify(allResults.slice(0, limit)), { headers });
     }
-  }
-
-  private jsonError(message: string, status: number): Response {
-    return new Response(JSON.stringify({ error: message }), {
-      status,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
-
-  private trackNotFound(): Response {
-    return new Response(
-      JSON.stringify({ code: 404, name: "TrackNotFound", message: "Failed to find specified track" }),
-      { status: 404, headers: { "Content-Type": "application/json" } }
-    );
   }
 }
