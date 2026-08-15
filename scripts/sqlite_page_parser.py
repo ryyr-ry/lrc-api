@@ -419,7 +419,7 @@ def parse_leaf_table_cells(page_data: bytes, bt_offset: int, U: int, encoding: i
                     overflow_resolved = False
                     break
             if not overflow_resolved:
-                results.append((rowid, ncols, None, None, None, ovfl_page_num, payload_size))
+                results.append((rowid, 0, None, bytes(payload), 0, False, ovfl_page_num, payload_size, page_data, offset))
                 continue
             payload = bytes(payload)
 
@@ -436,7 +436,6 @@ def parse_leaf_table_cells(page_data: bytes, bt_offset: int, U: int, encoding: i
         results.append((rowid, ncols, serial_types, payload, header_length, True))
 
     return results
-
 
 def classify_record(ncols: int, serial_types: list,
                     tracks_ncols: int = 11, lyrics_ncols: int = 12) -> str:

@@ -333,6 +333,7 @@ def main():
     lyrics_temp_offset = 0
 
     ring_buffer = RingBuffer(capacity=8192)
+    pending_overflows = []
 
     parser.enable_sequential_mode()
 
@@ -368,13 +369,12 @@ def main():
             )
 
             for cell in cells:
-                if len(cell) == 6:
-                    rowid, ncols, serial_types, payload, header_length, resolved = cell
-                    if not resolved:
-                        continue
-                else:
+                resolved = cell[5] if len(cell) >= 6 else True
+                if not resolved:
+                    pending_overflows.append(cell)
                     continue
 
+                rowid, ncols, serial_types, payload, header_length, _ = cell[:6]
                 table = classify_record(ncols, serial_types, tracks_ncols, lyrics_ncols)
 
                 if table == "skip":
@@ -461,13 +461,121 @@ def main():
             print(f"  pages: {page_num}/{parser.page_count} ({time.time()-t1:.1f}s)", flush=True)
 
     print(f"Scan done: {tc} tracks, {lc} lyrics in {time.time()-t1:.1f}s", flush=True)
-    if overflow_seeks > 0:
-        print(f"  Overflow seeks (ring buffer misses): {overflow_seeks}", flush=True)
+    print(f"  Pending overflows: {len(pending_overflows)}", flush=True)
 
     lyrics_temp_file.close()
     parser.close()
 
     print(f"  lyrics temp file: {lyrics_temp_offset} bytes ({lyrics_temp_offset/1073741824:.2f} GiB)", flush=True)
+
+    if pending_overflows:
+        print(f"\n=== Pass 2: Resolving {len(pending_overflows)} pending overflows ===", flush=True)
+        t_ov = time.time()
+        from rapidgzip import RapidgzipFile
+        gz_fix = RapidgzipFile(GZIP_PATH, parallelization=os.cpu_count())
+        gz_fix.seek(0, 2)
+        page_size_fix = parser.page_size
+        U_fix = parser.usable_size
+        resolved = 0
+        for cell in pending_overflows:
+            rowid = cell[0]
+            ovfl_page_num = cell[6]
+            total_payload_size = cell[7]
+            local_payload = cell[3]
+            offset = cell[9]
+            src_page = cell[8]
+
+            payload = bytearray(local_payload)
+            remaining = total_payload_size - len(local_payload)
+            current_ovfl = ovfl_page_num
+            while current_ovfl != 0 and remaining > 0:
+                off_fix = (current_ovfl - 1) * page_size_fix
+                gz_fix.seek(off_fix)
+                ovfl_raw = gz_fix.read(page_size_fix)
+                next_page = struct.unpack(">I", ovfl_raw[0:4])[0]
+                chunk = min(remaining, U_fix - 4)
+                payload.extend(ovfl_raw[4:4+chunk])
+                remaining -= chunk
+                current_ovfl = next_page
+            payload = bytes(payload)
+
+            header_length, hvsz = decode_varint_inline(payload, 0)
+            h_off = hvsz
+            serial_types = []
+            ncols = 0
+            while h_off < header_length:
+                st, stvsz = decode_varint_inline(payload, h_off)
+                serial_types.append(st)
+                h_off += stvsz
+                ncols += 1
+
+            table = classify_record(ncols, serial_types, tracks_ncols, lyrics_ncols)
+            if table == "skip":
+                continue
+
+            if table == "tracks":
+                tid = rowid
+                if tid <= max_tid and str_lens[tid] > 0:
+                    continue
+                name, artist, album, dur, last_lid = decode_tracks_record(
+                    payload, header_length, encoding, tracks_col_names
+                )
+                entry = name.encode("utf-8") + SEP + artist.encode("utf-8") + SEP + album.encode("utf-8")
+                str_offsets[tid] = len(string_data)
+                string_data.extend(entry)
+                str_lens[tid] = len(entry)
+                durations[tid] = dur
+                nl = _normalize(name)
+                al = _normalize(artist)
+                room_indices[tid] = _fnv((al + " " + nl).encode("utf-8")) % num_rooms
+                if last_lid is not None:
+                    if last_lid >= len(lyrics_first):
+                        lyrics_first.extend([0] * (last_lid - len(lyrics_first) + 1))
+                    next_track[tid] = lyrics_first[last_lid]
+                    lyrics_first[last_lid] = tid
+                else:
+                    null_ids.append(tid)
+                tc += 1
+                resolved += 1
+            elif table == "lyrics":
+                lid = rowid
+                if lid >= len(lyrics_offset):
+                    ext = lid - len(lyrics_offset) + 1
+                    lyrics_offset.extend([0] * ext)
+                    lyrics_compressed_len.extend([0] * ext)
+                    lyrics_instrumental.extend(bytearray(ext))
+                if lid >= len(lyrics_first):
+                    ext = lid - len(lyrics_first) + 1
+                    lyrics_first.extend([0] * ext)
+                if lyrics_compressed_len[lid] > 0:
+                    continue
+                plain, synced, lfile, instrumental = decode_lyrics_record(
+                    payload, header_length, encoding, lyrics_col_names
+                )
+                lyrics_instrumental[lid] = 1 if instrumental else 0
+                rec_bytes = bytearray()
+                if plain is not None:
+                    rec_bytes.extend(str(plain).encode("utf-8"))
+                rec_bytes.append(0x00)
+                if synced is not None:
+                    rec_bytes.extend(str(synced).encode("utf-8"))
+                rec_bytes.append(0x00)
+                if lfile is not None:
+                    rec_bytes.extend(str(lfile).encode("utf-8"))
+                rec_bytes.append(0x00)
+                compressed = lyrics_zctx.compress(bytes(rec_bytes))
+                lyrics_offset[lid] = lyrics_temp_offset
+                lyrics_compressed_len[lid] = len(compressed)
+                lyrics_temp_file2 = open(LYRICS_TEMP_PATH, "ab")
+                lyrics_temp_file2.write(compressed)
+                lyrics_temp_file2.close()
+                lyrics_temp_offset += len(compressed)
+                lc += 1
+                resolved += 1
+
+        print(f"  Resolved {resolved}/{len(pending_overflows)} in {time.time()-t_ov:.1f}s", flush=True)
+        gz_fix.close()
+        del pending_overflows
 
     print("\n=== Writing null-lyrics tracks ===", flush=True)
     t_null = time.time()
