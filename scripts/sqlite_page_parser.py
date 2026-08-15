@@ -471,6 +471,9 @@ class RingBuffer:
     def get(self, page_num: int) -> Optional[bytes]:
         return self._buf.get(page_num)
 
+    def __getitem__(self, page_num: int) -> bytes:
+        return self._buf[page_num]
+
     def __contains__(self, page_num: int) -> bool:
         return page_num in self._buf
 
