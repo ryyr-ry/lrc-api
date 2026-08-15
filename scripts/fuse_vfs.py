@@ -26,6 +26,8 @@ MANIFEST_PATH = sys.argv[1]
 CHUNK_DIR = sys.argv[2]
 MOUNT_POINT = sys.argv[3]
 
+FUSE_MAX_READ = 128 * 1024
+
 
 def loads_json(data):
     if HAVE_ORJSON:
@@ -34,6 +36,8 @@ def loads_json(data):
 
 
 class ChunkVFS(fuse.Operations):
+    use_ns = True
+
     def __init__(self, manifest_path, chunk_dir):
         print(f"Loading manifest: {manifest_path}", flush=True)
         with open(manifest_path) as f:
@@ -98,6 +102,12 @@ class ChunkVFS(fuse.Operations):
         return content
 
     @fuse.overrides(fuse.Operations)
+    def init_with_config(self, conn_info, config_3):
+        if conn_info is not None:
+            conn_info.max_read = FUSE_MAX_READ
+            conn_info.max_write = FUSE_MAX_READ
+
+    @fuse.overrides(fuse.Operations)
     def getattr(self, path, fh=None):
         if path == "/":
             return self.root_stat
@@ -116,7 +126,8 @@ class ChunkVFS(fuse.Operations):
     def read(self, path, size, offset, fh):
         name = path.lstrip("/")
         content = self._get_file_content(name)
-        return content[offset:offset + size]
+        actual_size = min(size, FUSE_MAX_READ)
+        return content[offset:offset + actual_size]
 
     @fuse.overrides(fuse.Operations)
     def open(self, path, flags):
