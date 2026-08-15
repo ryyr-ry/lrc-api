@@ -1,41 +1,40 @@
 #!/usr/bin/env python3
 """
 Generate manifest and zstd-compressed chunk files from LRCLIB SQLite DB.
+Uses direct SQLite page parsing (no APSW) for sequential gzip reading.
 
-Two-pass sequential scan (no JOIN) to avoid random access through gzip.
-Pass 1: Scan tracks -> packed string buffer + array-based lyrics mapping
-Pass 2: Scan lyrics -> construct records -> write to zstd chunk files
-
-Memory optimizations vs previous version:
-  - Single bytearray for all string data (eliminates Python str overhead ~49B/obj)
-  - array.array linked list for lyrics mapping (260 MB vs 2-3 GB dict)
-  - No normalized string storage (compute on-the-fly with str.translate)
-  - str.translate for normalize() (5x faster than multiple replace() calls)
-  - Total memory: ~3.5 GB (vs ~15 GB previous)
+Single-pass extraction of tracks and lyrics via page-format parsing.
+lyrics text is spilled to a zstd-compressed temp file, then read back
+to join with tracks metadata and write chunk files.
 """
 
 import os
 import sys
-import json
 import time
 import struct
 import array
 import unicodedata
-import shutil
-import apsw
 import zstandard
-from rapidgzip import RapidgzipFile
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from sqlite_page_parser import (
+    SQLitePageParser, decode_varint_inline, serial_type_size,
+    decode_serial_value, compute_local_payload_size, parse_schema,
+    parse_leaf_table_cells, classify_record, RingBuffer,
+)
 
 try:
     import orjson
     HAVE_ORJSON = True
 except ImportError:
+    import json
     HAVE_ORJSON = False
 
 GZIP_PATH = sys.argv[1]
 MANIFEST_PATH = sys.argv[2] if len(sys.argv) > 2 else "manifest.json"
 CONFIG_TS_PATH = sys.argv[3] if len(sys.argv) > 3 else "src/config.ts"
 CHUNK_DIR = sys.argv[4] if len(sys.argv) > 4 else "chunks"
+LYRICS_TEMP_PATH = "/tmp/lyrics_temp.zst"
 
 MAX_FILE_SIZE = 18 * 1024 * 1024
 ZSTD_LEVEL = 3
@@ -51,98 +50,6 @@ _PUNCT_TABLE = str.maketrans({
     "]": " ", "\\": " ", "/": " ", "\0": " ", "\n": " ",
     "'": None, "\u2019": None,
 })
-
-
-class GzipVFSFile:
-    def __init__(self, gz_file, db_size):
-        self._gz = gz_file
-        self._size = db_size
-        self._level = apsw.SQLITE_LOCK_NONE
-
-    def xRead(self, amount, offset):
-        self._gz.seek(offset)
-        data = self._gz.read(amount)
-        if len(data) < amount:
-            data += b"\x00" * (amount - len(data))
-        return data
-
-    def xFileSize(self):
-        return self._size
-
-    def xClose(self):
-        pass
-
-    def xLock(self, level):
-        self._level = level
-
-    def xUnlock(self, level):
-        self._level = level
-
-    def xCheckReservedLock(self):
-        return False
-
-    def xSync(self, flags):
-        return True
-
-    def xSectorSize(self):
-        return 4096
-
-    def xDeviceCharacteristics(self):
-        return apsw.SQLITE_IOCAP_IMMUTABLE
-
-    def xTruncate(self, newsize):
-        pass
-
-    def xWrite(self, data, offset):
-        pass
-
-    def xFileControl(self, op, ptr):
-        return False
-
-    def xShmMap(self, *a):
-        raise apsw.IOError("Shared memory not supported")
-
-    def xShmBarrier(self):
-        pass
-
-    def xShmUnmap(self):
-        pass
-
-
-class GzipVFS(apsw.VFS):
-    def __init__(self, gz_file, db_size, name="gzipvfs"):
-        self._gz = gz_file
-        self._size = db_size
-        self.vfs_name = name
-        super().__init__(name, base="")
-
-    def xOpen(self, name, flags):
-        return GzipVFSFile(self._gz, self._size)
-
-    def xDelete(self, name, syncdir):
-        pass
-
-    def xAccess(self, name, flags):
-        return True
-
-    def xFullPathname(self, name):
-        return name
-
-    def xSleep(self, us):
-        time.sleep(us / 1e6)
-        return True
-
-    def xCurrentTime(self):
-        return time.time() / 86400.0 + 2440587.5
-
-    def xGetLastError(self):
-        return (0, "")
-
-    def xDlError(self):
-        return ""
-
-    def xRandomness(self, n):
-        return os.urandom(n)
 
 
 def normalize(text):
@@ -168,8 +75,6 @@ def dumps_json(obj):
 
 
 class RoomWriter:
-    """Writes records to zstd-compressed chunk files for one room."""
-
     __slots__ = ("room_idx", "chunk_dir", "part", "handle", "compressor",
                  "uncompressed_size", "record_count", "files")
 
@@ -195,15 +100,12 @@ class RoomWriter:
     def write_record(self, json_bytes):
         if self.compressor is None:
             self._open_new_file()
-
         if self.record_count > 0:
             self.compressor.write(b",")
             self.uncompressed_size += 1
-
         self.compressor.write(json_bytes)
         self.uncompressed_size += len(json_bytes)
         self.record_count += 1
-
         if self.uncompressed_size >= MAX_FILE_SIZE:
             self._close_current_file()
 
@@ -226,6 +128,130 @@ class RoomWriter:
             self._close_current_file()
 
 
+def decode_tracks_record(payload, header_length, encoding, tracks_col_names):
+    """Decode only needed columns from a tracks record.
+    Needed: name(1), artist_name(2), album_name(3), duration(7), last_lyrics_id(8)
+    Skip: id(0, IPK), name_lower(4), artist_name_lower(5), album_name_lower(6), created_at(9), updated_at(10)
+    """
+    h_off = 0
+    header_len, hvsz = decode_varint_inline(payload, h_off)
+    h_off += hvsz
+
+    serial_types = []
+    while h_off < header_length:
+        st, stvsz = decode_varint_inline(payload, h_off)
+        serial_types.append(st)
+        h_off += stvsz
+
+    name = None
+    artist = None
+    album = None
+    dur = 0.0
+    last_lid = None
+
+    body_off = header_length
+    ncols = len(serial_types)
+
+    needed = {1: "name", 2: "artist_name", 3: "album_name", 7: "duration", 8: "last_lyrics_id"}
+
+    for ci in range(ncols):
+        st = serial_types[ci]
+        sz = serial_type_size(st)
+
+        if ci in needed:
+            val, body_off = decode_serial_value(payload, body_off, st, encoding)
+            col = needed[ci]
+            if val is not None:
+                if col == "name":
+                    name = val
+                elif col == "artist_name":
+                    artist = val
+                elif col == "album_name":
+                    album = val
+                elif col == "duration":
+                    dur = val
+                elif col == "last_lyrics_id":
+                    last_lid = val
+        else:
+            body_off += sz
+
+    if name is None:
+        name = ""
+    if artist is None:
+        artist = ""
+    if album is None:
+        album = ""
+
+    return name, artist, album, dur, last_lid
+
+
+def decode_lyrics_record(payload, header_length, encoding, lyrics_col_names):
+    """Decode only needed columns from a lyrics record.
+    Needed: plain_lyrics(1), synced_lyrics(2), lyricsfile(3), instrumental(8)
+    Skip: id(0, IPK), track_id(4), has_plain_lyrics(5), has_synced_lyrics(6), has_lyricsfile(7), source(9), created_at(10), updated_at(11)
+    """
+    h_off = 0
+    header_len, hvsz = decode_varint_inline(payload, h_off)
+    h_off += hvsz
+
+    serial_types = []
+    while h_off < header_length:
+        st, stvsz = decode_varint_inline(payload, h_off)
+        serial_types.append(st)
+        h_off += stvsz
+
+    plain = None
+    synced = None
+    lfile = None
+    instrumental = False
+
+    body_off = header_length
+    ncols = len(serial_types)
+
+    needed = {1: "plain_lyrics", 2: "synced_lyrics", 3: "lyricsfile", 8: "instrumental"}
+
+    for ci in range(ncols):
+        st = serial_types[ci]
+        sz = serial_type_size(st)
+
+        if ci in needed:
+            val, body_off = decode_serial_value(payload, body_off, st, encoding)
+            col = needed[ci]
+            if val is not None:
+                if col == "plain_lyrics":
+                    plain = val
+                elif col == "synced_lyrics":
+                    synced = val
+                elif col == "lyricsfile":
+                    lfile = val
+                elif col == "instrumental":
+                    instrumental = bool(val)
+        else:
+            body_off += sz
+
+    return plain, synced, lfile, instrumental
+
+
+def write_track_record(tid, name, artist, album, dur, instrumental,
+                        plain, synced, lfile, _norm, _dumps, room_writers, CHUNK_DIR,
+                        total_records, total_json_bytes):
+    rec = {
+        "id": tid, "name": name, "trackName": name,
+        "artistName": artist, "albumName": album, "duration": dur,
+        "instrumental": instrumental, "plainLyrics": plain,
+        "syncedLyrics": synced, "lyricsfile": lfile,
+        "nameLower": _norm(name), "artistNameLower": _norm(artist), "albumNameLower": _norm(album),
+    }
+    jb = _dumps(rec)
+    ridx = fnv1a_hash((_norm(artist) + " " + _norm(name)).encode("utf-8")) % _NUM_ROOMS
+    rw = room_writers.get(ridx)
+    if rw is None:
+        rw = RoomWriter(ridx, CHUNK_DIR)
+        room_writers[ridx] = rw
+    rw.write_record(jb)
+    return total_records + 1, total_json_bytes + len(jb), ridx
+
+
 def main():
     _normalize = normalize
     _fnv = fnv1a_hash
@@ -233,60 +259,41 @@ def main():
 
     print(f"Opening: {GZIP_PATH}", flush=True)
     t0 = time.time()
-    gz = RapidgzipFile(GZIP_PATH, parallelization=os.cpu_count())
 
-    try:
-        _main_body(gz, t0, _normalize, _fnv, _dumps)
-    finally:
-        try:
-            gz.close()
-        except Exception:
-            pass
+    parser = SQLitePageParser(GZIP_PATH, parallelization=os.cpu_count())
 
+    print(f"DB size: {parser.page_size * parser.page_count} "
+          f"({parser.page_size * parser.page_count / 1073741824:.2f} GiB)", flush=True)
+    print(f"Page size: {parser.page_size}, Pages: {parser.page_count}, "
+          f"Encoding: {parser.text_encoding}", flush=True)
 
-def _main_body(gz, t0, _normalize, _fnv, _dumps):
+    print("Building gzip block offset index (seek to end)...", flush=True)
+    t_idx = time.time()
+    parser.build_index()
+    print(f"Index built in {time.time() - t_idx:.1f}s", flush=True)
 
-    header = gz.read(100)
-    if header[:16] != b"SQLite format 3\x00":
-        print(f"ERROR: Not SQLite. Header: {header[:16]}", flush=True)
+    print("Parsing schema from page 1...", flush=True)
+    tables = parse_schema(parser)
+    if "tracks" not in tables or "lyrics" not in tables:
+        print(f"ERROR: Could not find tracks/lyrics tables. Found: {list(tables.keys())}", flush=True)
         sys.exit(1)
 
-    page_size = struct.unpack(">H", header[16:18])[0]
-    if page_size == 1:
-        page_size = 65536
-    page_count = struct.unpack(">I", header[28:32])[0]
-    db_size = page_size * page_count
-    print(f"DB size: {db_size} ({db_size/1073741824:.2f} GiB)", flush=True)
+    tracks_ncols = tables["tracks"]["ncols"]
+    lyrics_ncols = tables["lyrics"]["ncols"]
+    tracks_col_names = [c[0] for c in tables["tracks"]["columns"]]
+    lyrics_col_names = [c[0] for c in tables["lyrics"]["columns"]]
+    print(f"  tracks: {tracks_ncols} columns, root page {tables['tracks']['rootpage']}", flush=True)
+    print(f"  lyrics: {lyrics_ncols} columns, root page {tables['lyrics']['rootpage']}", flush=True)
 
-    gz.seek(0)
-    vfs = GzipVFS(gz, db_size)
-    conn = apsw.Connection(
-        "file:dummy?immutable=1",
-        vfs=vfs.vfs_name,
-        flags=apsw.SQLITE_OPEN_READONLY | apsw.SQLITE_OPEN_URI,
-    )
-    shutil.rmtree(CHUNK_DIR, ignore_errors=True)
-    os.makedirs(CHUNK_DIR, exist_ok=True)
-
-    # === Estimate total JSON size from SQLite database size ===
-    # The JSON representation is typically ~94% of the SQLite database size
-    # (SQLite has B-tree overhead, indexes, page headers that inflate the DB).
-    # This ratio was derived from the previous run: 218.55 GiB JSON / 232.78 GiB DB.
+    db_size = parser.page_size * parser.page_count
     estimated_total_json = int(db_size * 0.94)
-    print(f"\n=== Estimation ===", flush=True)
-    print(f"  DB size: {db_size} ({db_size/1073741824:.2f} GiB)", flush=True)
-    print(f"  Estimated JSON: {estimated_total_json} ({estimated_total_json/1073741824:.2f} GiB)", flush=True)
-
-    cur = conn.cursor()
-    cur2 = conn.cursor()
-
     room_target = 72 * 1024 * 1024
     num_rooms = max(1, int(estimated_total_json / room_target))
     num_rooms = ((num_rooms + 99) // 100) * 100
-    print(f"Estimated rooms: {num_rooms}", flush=True)
+    print(f"\nEstimated rooms: {num_rooms}", flush=True)
 
     if num_rooms > 65535:
-        print(f"ERROR: num_rooms ({num_rooms}) exceeds Uint16Array max (65535). Reduce room_target or increase MAX_FILE_SIZE.", flush=True)
+        print(f"ERROR: num_rooms ({num_rooms}) exceeds Uint16Array max (65535).", flush=True)
         sys.exit(1)
 
     chunks_per_agg = 72
@@ -295,6 +302,9 @@ def _main_body(gz, t0, _normalize, _fnv, _dumps):
     num_supers = 10
     print(f"  aggregators: {num_aggregators} (chunks_per_agg={chunks_per_agg})", flush=True)
     print(f"  supers: {num_supers}", flush=True)
+
+    global _NUM_ROOMS
+    _NUM_ROOMS = num_rooms
 
     max_tid = KNOWN_TRACK_COUNT
     max_lid = KNOWN_LYRICS_COUNT + 100000
@@ -308,90 +318,167 @@ def _main_body(gz, t0, _normalize, _fnv, _dumps):
     lyrics_first = array.array("I", [0] * (max_lid + 1))
     next_track = array.array("I", [0] * (max_tid + 1))
 
+    lyrics_offset = array.array("Q", [0] * (max_lid + 1))
+    lyrics_compressed_len = array.array("Q", [0] * (max_lid + 1))
+    lyrics_instrumental = bytearray(max_lid + 1)
+
     null_ids = []
 
-    print("\n=== PASS 1: Scanning tracks (sequential) ===", flush=True)
+    import shutil
+    shutil.rmtree(CHUNK_DIR, ignore_errors=True)
+    os.makedirs(CHUNK_DIR, exist_ok=True)
+
+    lyrics_zctx = zstandard.ZstdCompressor(level=ZSTD_LEVEL)
+    lyrics_temp_file = open(LYRICS_TEMP_PATH, "wb")
+    lyrics_temp_offset = 0
+
+    ring_buffer = RingBuffer(capacity=2048)
+
+    print("\n=== Sequential page scan (single pass) ===", flush=True)
     t1 = time.time()
     tc = 0
-    for row in cur.execute(
-        "SELECT id, name, artist_name, album_name, duration, last_lyrics_id FROM tracks ORDER BY id"
-    ):
-        tid = row[0]
-        if tid > max_tid:
-            ext = tid - max_tid
-            str_offsets.extend([0] * ext)
-            str_lens.extend([0] * ext)
-            durations.extend([0.0] * ext)
-            room_indices.extend([0] * ext)
-            matched.extend(bytearray(ext))
-            next_track.extend([0] * ext)
-            max_tid = tid
+    lc = 0
+    overflow_seeks = 0
+    page_num = 1
+    U = parser.usable_size
+    encoding = parser.text_encoding
 
-        name = row[1] or ""
-        artist = row[2] or ""
-        album = row[3] or ""
+    while page_num <= parser.page_count:
+        page_data = parser.read_page(page_num)
+        ring_buffer.put(page_num, page_data)
 
-        entry = name.encode("utf-8") + SEP + artist.encode("utf-8") + SEP + album.encode("utf-8")
-        str_offsets[tid] = len(string_data)
-        string_data.extend(entry)
-        str_lens[tid] = len(entry)
+        bt_offset = 100 if page_num == 1 else 0
+        if len(page_data) <= bt_offset:
+            page_num += 1
+            continue
 
-        durations[tid] = row[4] if row[4] is not None else 0.0
+        page_type = page_data[bt_offset]
 
-        nl = _normalize(name)
-        al = _normalize(artist)
-        room_indices[tid] = _fnv((al + " " + nl).encode("utf-8")) % num_rooms
+        if page_type == 13:
+            cells = parse_leaf_table_cells(
+                page_data, bt_offset, U, encoding,
+                lambda pn: parser.read_page(pn),
+                ring_buffer
+            )
 
-        lid = row[5]
-        if lid is not None:
-            if lid >= len(lyrics_first):
-                lyrics_first.extend([0] * (lid - len(lyrics_first) + 1))
-            next_track[tid] = lyrics_first[lid]
-            lyrics_first[lid] = tid
-        else:
-            null_ids.append(tid)
+            for rowid, ncols, serial_types, payload, header_length in cells:
+                table = classify_record(ncols, serial_types, tracks_ncols, lyrics_ncols)
 
-        tc += 1
-        if tc % 1000000 == 0:
-            print(f"  tracks: {tc} ({time.time()-t1:.1f}s)", flush=True)
+                if table == "tracks":
+                    tid = rowid
+                    if tid > max_tid:
+                        ext = tid - max_tid
+                        str_offsets.extend([0] * ext)
+                        str_lens.extend([0] * ext)
+                        durations.extend([0.0] * ext)
+                        room_indices.extend([0] * ext)
+                        matched.extend(bytearray(ext))
+                        next_track.extend([0] * ext)
+                        max_tid = tid
 
-    print(f"Pass 1 done: {tc} tracks in {time.time()-t1:.1f}s", flush=True)
-    print(f"  NULL last_lyrics_id: {len(null_ids)}", flush=True)
+                    name, artist, album, dur, last_lid = decode_tracks_record(
+                        payload, header_length, encoding, tracks_col_names
+                    )
+
+                    entry = name.encode("utf-8") + SEP + artist.encode("utf-8") + SEP + album.encode("utf-8")
+                    str_offsets[tid] = len(string_data)
+                    string_data.extend(entry)
+                    str_lens[tid] = len(entry)
+                    durations[tid] = dur
+
+                    nl = _normalize(name)
+                    al = _normalize(artist)
+                    room_indices[tid] = _fnv((al + " " + nl).encode("utf-8")) % num_rooms
+
+                    if last_lid is not None:
+                        if last_lid >= len(lyrics_first):
+                            lyrics_first.extend([0] * (last_lid - len(lyrics_first) + 1))
+                        next_track[tid] = lyrics_first[last_lid]
+                        lyrics_first[last_lid] = tid
+                    else:
+                        null_ids.append(tid)
+
+                    tc += 1
+                    if tc % 1000000 == 0:
+                        print(f"  tracks: {tc} ({time.time()-t1:.1f}s)", flush=True)
+
+                elif table == "lyrics":
+                    lid = rowid
+                    if lid >= len(lyrics_offset):
+                        ext = lid - len(lyrics_offset) + 1
+                        lyrics_offset.extend([0] * ext)
+                        lyrics_compressed_len.extend([0] * ext)
+                        lyrics_instrumental.extend(bytearray(ext))
+                    if lid >= len(lyrics_first):
+                        ext = lid - len(lyrics_first) + 1
+                        lyrics_first.extend([0] * ext)
+
+                    plain, synced, lfile, instrumental = decode_lyrics_record(
+                        payload, header_length, encoding, lyrics_col_names
+                    )
+
+                    lyrics_instrumental[lid] = 1 if instrumental else 0
+
+                    rec_bytes = bytearray()
+                    if plain is not None:
+                        rec_bytes.extend(plain.encode("utf-8"))
+                    rec_bytes.append(0x00)
+                    if synced is not None:
+                        rec_bytes.extend(synced.encode("utf-8"))
+                    rec_bytes.append(0x00)
+                    if lfile is not None:
+                        rec_bytes.extend(lfile.encode("utf-8"))
+                    rec_bytes.append(0x00)
+
+                    compressed = lyrics_zctx.compress(bytes(rec_bytes))
+                    lyrics_offset[lid] = lyrics_temp_offset
+                    lyrics_compressed_len[lid] = len(compressed)
+                    lyrics_temp_file.write(compressed)
+                    lyrics_temp_offset += len(compressed)
+
+                    lc += 1
+                    if lc % 1000000 == 0:
+                        print(f"  lyrics: {lc} ({time.time()-t1:.1f}s)", flush=True)
+
+        page_num += 1
+        if page_num % 100000 == 0:
+            print(f"  pages: {page_num}/{parser.page_count} ({time.time()-t1:.1f}s)", flush=True)
+
+    print(f"Scan done: {tc} tracks, {lc} lyrics in {time.time()-t1:.1f}s", flush=True)
+    if overflow_seeks > 0:
+        print(f"  Overflow seeks (ring buffer misses): {overflow_seeks}", flush=True)
+
+    lyrics_temp_file.close()
+    parser.close()
+
+    print(f"  lyrics temp file: {lyrics_temp_offset} bytes ({lyrics_temp_offset/1073741824:.2f} GiB)", flush=True)
+
+    print("\n=== Writing null-lyrics tracks ===", flush=True)
+    t_null = time.time()
 
     room_writers = {}
     total_records = 0
     total_json_bytes = 0
 
-    print("\n=== Writing null-lyrics tracks ===", flush=True)
-    t_null = time.time()
-    _str_data = string_data
-    _str_off = str_offsets
-    _str_len = str_lens
-    _dur = durations
-    _ri = room_indices
-    _norm = _normalize
-
     for tid in null_ids:
-        ridx = _ri[tid]
+        ridx = room_indices[tid]
         rw = room_writers.get(ridx)
         if rw is None:
             rw = RoomWriter(ridx, CHUNK_DIR)
             room_writers[ridx] = rw
-
-        start = _str_off[tid]
-        raw = _str_data[start:start + _str_len[tid]]
+        start = str_offsets[tid]
+        raw = bytes(string_data[start:start + str_lens[tid]])
         parts = raw.split(SEP)
         name = parts[0].decode("utf-8")
         artist = parts[1].decode("utf-8")
         album = parts[2].decode("utf-8")
-        dur = _dur[tid]
-
+        dur = durations[tid]
         rec = {
             "id": tid, "name": name, "trackName": name,
             "artistName": artist, "albumName": album, "duration": dur,
             "instrumental": False, "plainLyrics": None, "syncedLyrics": None,
             "lyricsfile": None,
-            "nameLower": _norm(name), "artistNameLower": _norm(artist), "albumNameLower": _norm(album),
+            "nameLower": _normalize(name), "artistNameLower": _normalize(artist), "albumNameLower": _normalize(album),
         }
         jb = _dumps(rec)
         rw.write_record(jb)
@@ -401,22 +488,32 @@ def _main_body(gz, t0, _normalize, _fnv, _dumps):
     print(f"  Null-lyrics: {len(null_ids)} ({time.time()-t_null:.1f}s)", flush=True)
     del null_ids
 
-    print("\n=== PASS 2: Scanning lyrics (sequential) ===", flush=True)
+    print("\n=== Reading back lyrics and joining with tracks ===", flush=True)
     t2 = time.time()
-    lc = 0
+
+    lyrics_zdctx = zstandard.ZstdDecompressor()
+    lyrics_read_fh = open(LYRICS_TEMP_PATH, "rb")
     mc = 0
-    for row in cur2.execute(
-        "SELECT id, instrumental, plain_lyrics, synced_lyrics, lyricsfile FROM lyrics ORDER BY id"
-    ):
-        lid = row[0]
-        instrumental = bool(row[1]) if row[1] is not None else False
-        plain = row[2]
-        synced = row[3]
-        lfile = row[4]
+
+    for lid in range(1, max_lid + 1):
+        if lid >= len(lyrics_offset) or lyrics_compressed_len[lid] == 0:
+            continue
+
+        off = lyrics_offset[lid]
+        clen = lyrics_compressed_len[lid]
+        lyrics_read_fh.seek(off)
+        compressed_chunk = lyrics_read_fh.read(clen)
+        decompressed = lyrics_zdctx.decompress(compressed_chunk)
+
+        parts = decompressed.split(b"\x00")
+        plain = parts[0].decode("utf-8") if parts[0] else None
+        synced = parts[1].decode("utf-8") if len(parts) > 1 and parts[1] else None
+        lfile = parts[2].decode("utf-8") if len(parts) > 2 and parts[2] else None
+        instrumental = bool(lyrics_instrumental[lid])
 
         tid = lyrics_first[lid] if lid < len(lyrics_first) else 0
         while tid != 0:
-            if tid <= max_tid and str_lens[tid] > 0:
+            if tid <= max_tid and str_lens[tid] > 0 and not matched[tid]:
                 ridx = room_indices[tid]
                 rw = room_writers.get(ridx)
                 if rw is None:
@@ -424,11 +521,11 @@ def _main_body(gz, t0, _normalize, _fnv, _dumps):
                     room_writers[ridx] = rw
 
                 start = str_offsets[tid]
-                raw = string_data[start:start + str_lens[tid]]
-                parts = raw.split(SEP)
-                name = parts[0].decode("utf-8")
-                artist = parts[1].decode("utf-8")
-                album = parts[2].decode("utf-8")
+                raw = bytes(string_data[start:start + str_lens[tid]])
+                tparts = raw.split(SEP)
+                name = tparts[0].decode("utf-8")
+                artist = tparts[1].decode("utf-8")
+                album = tparts[2].decode("utf-8")
                 dur = durations[tid]
 
                 rec = {
@@ -436,7 +533,7 @@ def _main_body(gz, t0, _normalize, _fnv, _dumps):
                     "artistName": artist, "albumName": album, "duration": dur,
                     "instrumental": instrumental, "plainLyrics": plain,
                     "syncedLyrics": synced, "lyricsfile": lfile,
-                    "nameLower": _norm(name), "artistNameLower": _norm(artist), "albumNameLower": _norm(album),
+                    "nameLower": _normalize(name), "artistNameLower": _normalize(artist), "albumNameLower": _normalize(album),
                 }
                 jb = _dumps(rec)
                 rw.write_record(jb)
@@ -447,14 +544,13 @@ def _main_body(gz, t0, _normalize, _fnv, _dumps):
 
             tid = next_track[tid]
 
-        lc += 1
-        if lc % 1000000 == 0:
-            print(f"  lyrics: {lc} ({time.time()-t2:.1f}s)", flush=True)
+    print(f"Lyrics join done: {mc} matched in {time.time()-t2:.1f}s", flush=True)
 
-    print(f"Pass 2 done: {lc} lyrics in {time.time()-t2:.1f}s", flush=True)
-    print(f"  matched tracks: {mc}", flush=True)
+    lyrics_read_fh.close()
+    os.remove(LYRICS_TEMP_PATH)
+    print(f"  Removed lyrics temp file", flush=True)
 
-    del lyrics_first, next_track
+    del lyrics_first, next_track, lyrics_offset, lyrics_compressed_len, lyrics_instrumental
 
     print("\n=== Writing unmatched tracks ===", flush=True)
     t_unm = time.time()
@@ -466,21 +562,19 @@ def _main_body(gz, t0, _normalize, _fnv, _dumps):
             if rw is None:
                 rw = RoomWriter(ridx, CHUNK_DIR)
                 room_writers[ridx] = rw
-
             start = str_offsets[tid]
-            raw = string_data[start:start + str_lens[tid]]
+            raw = bytes(string_data[start:start + str_lens[tid]])
             parts = raw.split(SEP)
             name = parts[0].decode("utf-8")
             artist = parts[1].decode("utf-8")
             album = parts[2].decode("utf-8")
             dur = durations[tid]
-
             rec = {
                 "id": tid, "name": name, "trackName": name,
                 "artistName": artist, "albumName": album, "duration": dur,
                 "instrumental": False, "plainLyrics": None, "syncedLyrics": None,
                 "lyricsfile": None,
-                "nameLower": _norm(name), "artistNameLower": _norm(artist), "albumNameLower": _norm(album),
+                "nameLower": _normalize(name), "artistNameLower": _normalize(artist), "albumNameLower": _normalize(album),
             }
             jb = _dumps(rec)
             rw.write_record(jb)
@@ -492,7 +586,7 @@ def _main_body(gz, t0, _normalize, _fnv, _dumps):
     del string_data, str_offsets, str_lens, durations, matched
 
     print("\n=== Writing id-to-chunk index files ===", flush=True)
-    t_idx = time.time()
+    t_idx2 = time.time()
     INDEX_PART_U16S = (16 * 1024 * 1024) // 2
     index_total_u16s = max_tid + 1
     num_index_parts = (index_total_u16s + INDEX_PART_U16S - 1) // INDEX_PART_U16S
@@ -511,7 +605,7 @@ def _main_body(gz, t0, _normalize, _fnv, _dumps):
             "name": part_name,
             "size": len(raw_bytes),
         })
-    print(f"  Index files: {len(index_files)} ({time.time()-t_idx:.1f}s)", flush=True)
+    print(f"  Index files: {len(index_files)} ({time.time()-t_idx2:.1f}s)", flush=True)
 
     del room_indices
 
@@ -565,8 +659,6 @@ def _main_body(gz, t0, _normalize, _fnv, _dumps):
         f.write(f"export const INDEX_FILES = {num_index_parts};\n")
     print(f"  config.ts written to {CONFIG_TS_PATH}", flush=True)
     print(f"  Total time: {time.time()-t0:.1f}s", flush=True)
-
-    conn.close()
 
 
 if __name__ == "__main__":

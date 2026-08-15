@@ -19,6 +19,9 @@ env:
   PUBLIC_DIR: public/data
   RELEASE_TAG: chunks-latest
 
+permissions:
+  contents: write
+
 jobs:
   generate:
     name: Generate chunks and upload to Releases
@@ -34,7 +37,7 @@ jobs:
 
       - name: Install Python dependencies
         run: |
-          pip install --no-cache-dir rapidgzip apsw mfusepy orjson zstandard
+          pip install --no-cache-dir rapidgzip orjson zstandard
 
       - name: Install Node dependencies
         run: bun install
@@ -52,34 +55,70 @@ jobs:
           rm -f "$GZIP_PATH"
           df -h /tmp
 
-      - name: Pack chunks into 2GB split archives
-        run: |
-          cd "$CHUNK_DIR"
-          tar cf - . | split -b 1900MB - chunk_archive_
-          echo "Archive parts: $(ls chunk_archive_* | wc -l)"
-
-      - name: Delete existing release
-        run: |
-          gh release delete "$RELEASE_TAG" --yes --cleanup-tag 2>/dev/null || true
+      - name: Pack and upload to Releases (pipelined)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Create release and upload archives
         run: |
+          set -euo pipefail
+
+          cd "$CHUNK_DIR"
+
+          python3 -c "
+          import os, sys
+          target = 1900 * 1024 * 1024
+          group, size = [], 0
+          for fn in sorted(os.listdir('.')):
+              s = os.path.getsize(fn)
+              if fn.startswith('part_') or fn.startswith('chunk_archive_'):
+                  continue
+              if size + s > target and group:
+                  print(':'.join(group))
+                  group, size = [], 0
+              group.append(fn)
+              size += s
+          if group:
+              print(':'.join(group))
+          " > /tmp/file_groups
+
+          NUM_GROUPS=$(wc -l < /tmp/file_groups)
+          echo "$NUM_GROUPS archive groups"
+
+          gh release delete "$RELEASE_TAG" --yes --cleanup-tag 2>/dev/null || true
+
           gh release create "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --title "Chunk archives (auto)" \
             --notes "Auto-generated chunk archives" \
-            --prerelease \
-            "$CHUNK_DIR"/chunk_archive_*
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            --prerelease --draft
 
-      - name: Upload config.ts and manifest as release assets
-        run: |
-          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" src/config.ts "$MANIFEST_PATH" --clobber
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPLOAD_URL=$(gh api repos/"$GITHUB_REPOSITORY"/releases/tags/"$RELEASE_TAG" \
+            --jq '.upload_url' | sed 's/{.*}//')
+
+          i=0
+          while IFS= read -r group; do
+              i=$((i+1))
+              part=$(printf "part_%04d.tar" "$i")
+              IFS=':' read -ra files <<< "$group"
+              tar cf "$part" "${files[@]}" && \
+              curl -sS -f --retry 3 -X POST "$UPLOAD_URL?name=$part" \
+                  -H "Authorization: Bearer $GH_TOKEN" \
+                  -H "Content-Type: application/octet-stream" \
+                  --data-binary @"$part" && \
+              rm -f "$part" &
+              while [ "$(jobs -r | wc -l)" -ge 5 ]; do sleep 0.5; done
+          done < /tmp/file_groups
+          wait
+
+          ASSET_COUNT=$(gh api repos/"$GITHUB_REPOSITORY"/releases/tags/"$RELEASE_TAG" \
+            --jq '.assets | length')
+          echo "Assets uploaded: $ASSET_COUNT"
+
+          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            "$GITHUB_WORKSPACE/src/config.ts" "$MANIFEST_PATH" --clobber
+
+          gh release edit "$RELEASE_TAG" --draft=false --repo "$GITHUB_REPOSITORY"
+
+          echo "Release published with $ASSET_COUNT archive parts + 2 metadata files"
 
       - name: Trigger deploy job
         if: success() && github.event_name == 'push'
@@ -132,16 +171,26 @@ jobs:
         run: |
           pip install --no-cache-dir mfusepy orjson zstandard
 
-      - name: Download chunk archives from release
+      - name: Download chunk archives (parallel)
         run: |
           mkdir -p "$CHUNK_DIR"
-          if ! gh release download "$RELEASE_TAG" --pattern "chunk_archive_*" --dir "$CHUNK_DIR" --clobber 2>/dev/null; then
+          gh api repos/"$GITHUB_REPOSITORY"/releases/tags/"$RELEASE_TAG" \
+            --jq '.assets[] | select(.name | test("part_")) | .browser_download_url' \
+            > /tmp/urls.txt
+
+          URL_COUNT=$(wc -l < /tmp/urls.txt)
+          echo "Downloading $URL_COUNT archive parts..."
+
+          if [ "$URL_COUNT" -eq 0 ]; then
             echo "::error::No chunk archives found in release $RELEASE_TAG. Trigger a workflow with [regenerate] in commit message first."
             exit 1
           fi
+
+          aria2c -x 16 -s 16 -j 8 -d "$CHUNK_DIR" -i /tmp/urls.txt
+
           cd "$CHUNK_DIR"
-          cat chunk_archive_* | tar xf -
-          rm -f chunk_archive_*
+          ls part_*.tar | xargs -P 4 -I {} tar xf {}
+          rm -f part_*.tar
           echo "Chunk files: $(ls | wc -l)"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
