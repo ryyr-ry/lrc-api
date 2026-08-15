@@ -334,6 +334,8 @@ def main():
 
     ring_buffer = RingBuffer(capacity=2048)
 
+    parser.enable_sequential_mode()
+
     print("\n=== Sequential page scan (single pass) ===", flush=True)
     t1 = time.time()
     tc = 0
@@ -367,6 +369,9 @@ def main():
 
             for rowid, ncols, serial_types, payload, header_length in cells:
                 table = classify_record(ncols, serial_types, tracks_ncols, lyrics_ncols)
+
+                if table == "skip":
+                    continue
 
                 if table == "tracks":
                     tid = rowid

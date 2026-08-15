@@ -19,7 +19,8 @@ class SQLitePageParser:
         from rapidgzip import RapidgzipFile
         self.gz_path = gz_path
         self.gz = RapidgzipFile(gz_path, parallelization=parallelization or os.cpu_count())
-        self.gz_seek = None
+        self.gz_seq = None
+        self._sequential_mode = False
         self.page_size = 0
         self.reserved_size = 0
         self.usable_size = 0
@@ -27,12 +28,13 @@ class SQLitePageParser:
         self.text_encoding = 1
         self._read_header()
 
+    def enable_sequential_mode(self):
+        self._sequential_mode = True
+        from rapidgzip import RapidgzipFile
+        self.gz_seq = RapidgzipFile(self.gz_path, parallelization=os.cpu_count())
+
     def _get_seek_handle(self):
-        if self.gz_seek is None:
-            from rapidgzip import RapidgzipFile
-            self.gz_seek = RapidgzipFile(self.gz_path, parallelization=os.cpu_count())
-            self.gz_seek.seek(0, 2)
-        return self.gz_seek
+        return self.gz
 
     def _read_header(self):
         header = self._read_exact(100)
@@ -57,10 +59,26 @@ class SQLitePageParser:
         self.gz.seek(0, 2)
 
     def seek_to_beginning(self):
-        self.gz.seek(0)
+        if self.gz_seq is not None:
+            self.gz_seq.seek(0)
+        else:
+            self.gz.seek(0)
 
     def read_sequential_page(self) -> bytes:
-        return self._read_exact(self.page_size)
+        return self._read_exact_seq(self.page_size)
+
+    def _read_exact_seq(self, n: int) -> bytes:
+        buf = bytearray()
+        fh = self.gz_seq if self.gz_seq is not None else self.gz
+        while len(buf) < n:
+            chunk = fh.read(n - len(buf))
+            if not chunk:
+                if len(buf) == 0:
+                    raise EOFError("Unexpected end of stream")
+                buf.extend(b"\x00" * (n - len(buf)))
+                break
+            buf.extend(chunk)
+        return bytes(buf)
 
     def _read_exact(self, n: int) -> bytes:
         buf = bytearray()
@@ -76,7 +94,10 @@ class SQLitePageParser:
 
     def read_page(self, page_num: int) -> bytes:
         offset = (page_num - 1) * self.page_size
-        fh = self._get_seek_handle()
+        if self._sequential_mode:
+            fh = self._get_seek_handle()
+        else:
+            fh = self.gz
         fh.seek(offset)
         buf = bytearray()
         remaining = self.page_size
@@ -107,7 +128,7 @@ class SQLitePageParser:
             page_num += 1
 
     def close(self):
-        for fh in (self.gz, self.gz_seek):
+        for fh in (self.gz, self.gz_seq):
             if fh is not None:
                 try:
                     fh.close()
@@ -417,12 +438,12 @@ def parse_leaf_table_cells(page_data: bytes, bt_offset: int, U: int, encoding: i
 
 def classify_record(ncols: int, serial_types: list,
                     tracks_ncols: int = 11, lyrics_ncols: int = 12) -> str:
+    if ncols < 8:
+        return "skip"
     if ncols == tracks_ncols:
         return "tracks"
     if ncols == lyrics_ncols:
         return "lyrics"
-    if ncols < 8:
-        raise ValueError(f"Table has too few columns (likely sqlite_sequence or other system table): ncols={ncols}")
     if ncols < tracks_ncols and ncols != lyrics_ncols:
         return "tracks"
     if ncols < lyrics_ncols and ncols != tracks_ncols:
