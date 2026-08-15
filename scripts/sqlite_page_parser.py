@@ -21,6 +21,8 @@ class SQLitePageParser:
         self.gz = RapidgzipFile(gz_path, parallelization=parallelization or os.cpu_count())
         self.gz_seq = None
         self._sequential_mode = False
+        self._seq_buf = bytearray()
+        self._seq_buf_pos = 0
         self.page_size = 0
         self.reserved_size = 0
         self.usable_size = 0
@@ -63,22 +65,41 @@ class SQLitePageParser:
             self.gz_seq.seek(0)
         else:
             self.gz.seek(0)
+        self._seq_buf = bytearray()
+        self._seq_buf_pos = 0
 
     def read_sequential_page(self) -> bytes:
-        return self._read_exact_seq(self.page_size)
+        ps = self.page_size
+        if self._seq_buf_pos + ps <= len(self._seq_buf):
+            page = bytes(self._seq_buf[self._seq_buf_pos:self._seq_buf_pos + ps])
+            self._seq_buf_pos += ps
+            return page
 
-    def _read_exact_seq(self, n: int) -> bytes:
-        buf = bytearray()
         fh = self.gz_seq if self.gz_seq is not None else self.gz
-        while len(buf) < n:
-            chunk = fh.read(n - len(buf))
+        remaining = ps
+        page = bytearray()
+
+        if self._seq_buf_pos < len(self._seq_buf):
+            page.extend(self._seq_buf[self._seq_buf_pos:])
+            remaining -= len(self._seq_buf) - self._seq_buf_pos
+
+        CHUNK = 4 * 1024 * 1024
+        while remaining > 0:
+            to_read = max(CHUNK, remaining)
+            chunk = fh.read(to_read)
             if not chunk:
-                if len(buf) == 0:
-                    raise EOFError("Unexpected end of stream")
-                buf.extend(b"\x00" * (n - len(buf)))
+                page.extend(b"\x00" * remaining)
                 break
-            buf.extend(chunk)
-        return bytes(buf)
+            if len(chunk) >= remaining:
+                page.extend(chunk[:remaining])
+                self._seq_buf = bytearray(chunk)
+                self._seq_buf_pos = remaining
+                remaining = 0
+            else:
+                page.extend(chunk)
+                remaining -= len(chunk)
+
+        return bytes(page)
 
     def _read_exact(self, n: int) -> bytes:
         buf = bytearray()
