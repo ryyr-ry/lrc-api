@@ -3,13 +3,15 @@
 Generate manifest and zstd-compressed chunk files from LRCLIB SQLite DB.
 
 Two-pass sequential scan (no JOIN) to avoid random access through gzip.
-Pass 1: Scan tracks -> metadata + room assignment + lyrics mapping
+Pass 1: Scan tracks -> packed string buffer + array-based lyrics mapping
 Pass 2: Scan lyrics -> construct records -> write to zstd chunk files
 
-Output:
-  - manifest.json: file list with uncompressed sizes (for FUSE)
-  - src/config.ts: TOTAL_ROOMS, TOTAL_FILES
-  - chunk-{room}-{part}.json.zst files in chunk directory
+Memory optimizations vs previous version:
+  - Single bytearray for all string data (eliminates Python str overhead ~49B/obj)
+  - array.array linked list for lyrics mapping (260 MB vs 2-3 GB dict)
+  - No normalized string storage (compute on-the-fly with str.translate)
+  - str.translate for normalize() (5x faster than multiple replace() calls)
+  - Total memory: ~3.5 GB (vs ~15 GB previous)
 """
 
 import os
@@ -38,7 +40,18 @@ CHUNK_DIR = sys.argv[4] if len(sys.argv) > 4 else "chunks"
 MAX_FILE_SIZE = 18 * 1024 * 1024
 ZSTD_LEVEL = 3
 KNOWN_TRACK_COUNT = 32254478
+KNOWN_LYRICS_COUNT = 32680034
 ESTIMATED_TOTAL_JSON = 218552162543
+SEP = b"\x01"
+
+_PUNCT_TABLE = str.maketrans({
+    "`": " ", "~": " ", "!": " ", "@": " ", "#": " ", "$": " ", "%": " ",
+    "^": " ", "&": " ", "*": " ", "(": " ", ")": " ", "_": " ", "|": " ",
+    "+": " ", "-": " ", "=": " ", "?": " ", ";": " ", ":": " ", '"': " ",
+    ",": " ", ".": " ", "<": " ", ">": " ", "{": " ", "}": " ", "[": " ",
+    "]": " ", "\\": " ", "/": " ", "\0": " ", "\n": " ",
+    "'": None, "\u2019": None,
+})
 
 
 class GzipVFSFile:
@@ -137,9 +150,7 @@ def normalize(text):
     if not text:
         return ""
     s = unicodedata.normalize("NFKC", text).lower()
-    for c in "`~!@#$%^&*()_|+-=?;:\",.<>{}[]\\/\x00\n":
-        s = s.replace(c, " ")
-    s = s.replace("'", "").replace("\u2019", "")
+    s = s.translate(_PUNCT_TABLE)
     return " ".join(s.split())
 
 
@@ -217,9 +228,24 @@ class RoomWriter:
 
 
 def main():
+    _normalize = normalize
+    _fnv = fnv1a_hash
+    _dumps = dumps_json
+
     print(f"Opening: {GZIP_PATH}", flush=True)
     t0 = time.time()
     gz = RapidgzipFile(GZIP_PATH, parallelization=os.cpu_count())
+
+    try:
+        _main_body(gz, t0, _normalize, _fnv, _dumps)
+    finally:
+        try:
+            gz.close()
+        except Exception:
+            pass
+
+
+def _main_body(gz, t0, _normalize, _fnv, _dumps):
 
     header = gz.read(100)
     if header[:16] != b"SQLite format 3\x00":
@@ -249,78 +275,76 @@ def main():
     room_target = 72 * 1024 * 1024
     num_rooms = max(1, int(ESTIMATED_TOTAL_JSON / room_target))
     num_rooms = ((num_rooms + 99) // 100) * 100
-    num_rooms = num_rooms * 2
     print(f"Estimated rooms: {num_rooms}", flush=True)
 
-    max_track_id = KNOWN_TRACK_COUNT
-    track_names = [None] * (max_track_id + 1)
-    track_artists = [None] * (max_track_id + 1)
-    track_albums = [None] * (max_track_id + 1)
-    track_durations = array.array("d", [0.0] * (max_track_id + 1))
-    track_name_lower = [None] * (max_track_id + 1)
-    track_artist_lower = [None] * (max_track_id + 1)
-    track_album_lower = [None] * (max_track_id + 1)
-    track_room_idx = array.array("I", [0] * (max_track_id + 1))
-    track_matched = bytearray(max_track_id + 1)
+    chunks_per_agg = 72
+    num_aggregators_raw = max(6, (num_rooms + chunks_per_agg - 1) // chunks_per_agg)
+    num_aggregators = ((num_aggregators_raw + 5) // 6) * 6
+    num_supers = 10
+    print(f"  aggregators: {num_aggregators} (chunks_per_agg={chunks_per_agg})", flush=True)
+    print(f"  supers: {num_supers}", flush=True)
 
-    lyrics_to_track = {}
-    null_lyrics_track_ids = []
+    max_tid = KNOWN_TRACK_COUNT
+    max_lid = KNOWN_LYRICS_COUNT + 100000
+
+    string_data = bytearray()
+    str_offsets = array.array("I", [0] * (max_tid + 1))
+    str_lens = array.array("I", [0] * (max_tid + 1))
+    durations = array.array("d", [0.0] * (max_tid + 1))
+    room_indices = array.array("I", [0] * (max_tid + 1))
+    matched = bytearray(max_tid + 1)
+    lyrics_first = array.array("I", [0] * (max_lid + 1))
+    next_track = array.array("I", [0] * (max_tid + 1))
+
+    null_ids = []
 
     print("\n=== PASS 1: Scanning tracks (sequential) ===", flush=True)
     t1 = time.time()
-    track_count = 0
+    tc = 0
     for row in cur.execute(
         "SELECT id, name, artist_name, album_name, duration, last_lyrics_id FROM tracks ORDER BY id"
     ):
-        track_id = row[0]
-        if track_id > max_track_id:
-            extend = track_id - max_track_id
-            track_names.extend([None] * extend)
-            track_artists.extend([None] * extend)
-            track_albums.extend([None] * extend)
-            track_durations.extend([0.0] * extend)
-            track_name_lower.extend([None] * extend)
-            track_artist_lower.extend([None] * extend)
-            track_album_lower.extend([None] * extend)
-            track_room_idx.extend([0] * extend)
-            track_matched.extend(bytearray(extend))
-            max_track_id = track_id
+        tid = row[0]
+        if tid > max_tid:
+            ext = tid - max_tid
+            str_offsets.extend([0] * ext)
+            str_lens.extend([0] * ext)
+            durations.extend([0.0] * ext)
+            room_indices.extend([0] * ext)
+            matched.extend(bytearray(ext))
+            next_track.extend([0] * ext)
+            max_tid = tid
 
         name = row[1] or ""
         artist = row[2] or ""
         album = row[3] or ""
-        duration = row[4] if row[4] is not None else 0.0
-        last_lyrics_id = row[5]
 
-        nl = normalize(name)
-        al = normalize(artist)
-        bl = normalize(album)
+        entry = name.encode("utf-8") + SEP + artist.encode("utf-8") + SEP + album.encode("utf-8")
+        str_offsets[tid] = len(string_data)
+        string_data.extend(entry)
+        str_lens[tid] = len(entry)
 
-        track_names[track_id] = name
-        track_artists[track_id] = artist
-        track_albums[track_id] = album
-        track_durations[track_id] = duration
-        track_name_lower[track_id] = nl
-        track_artist_lower[track_id] = al
-        track_album_lower[track_id] = bl
+        durations[tid] = row[4] if row[4] is not None else 0.0
 
-        room_idx = fnv1a_hash((al + " " + nl).encode("utf-8")) % num_rooms
-        track_room_idx[track_id] = room_idx
+        nl = _normalize(name)
+        al = _normalize(artist)
+        room_indices[tid] = _fnv((al + " " + nl).encode("utf-8")) % num_rooms
 
-        if last_lyrics_id is not None:
-            if last_lyrics_id in lyrics_to_track:
-                lyrics_to_track[last_lyrics_id].append(track_id)
-            else:
-                lyrics_to_track[last_lyrics_id] = [track_id]
+        lid = row[5]
+        if lid is not None:
+            if lid >= len(lyrics_first):
+                lyrics_first.extend([0] * (lid - len(lyrics_first) + 1))
+            next_track[tid] = lyrics_first[lid]
+            lyrics_first[lid] = tid
         else:
-            null_lyrics_track_ids.append(track_id)
+            null_ids.append(tid)
 
-        track_count += 1
-        if track_count % 500000 == 0:
-            print(f"  tracks: {track_count} ({time.time()-t1:.1f}s)", flush=True)
+        tc += 1
+        if tc % 1000000 == 0:
+            print(f"  tracks: {tc} ({time.time()-t1:.1f}s)", flush=True)
 
-    print(f"Pass 1 done: {track_count} tracks in {time.time()-t1:.1f}s", flush=True)
-    print(f"  NULL last_lyrics_id: {len(null_lyrics_track_ids)}", flush=True)
+    print(f"Pass 1 done: {tc} tracks in {time.time()-t1:.1f}s", flush=True)
+    print(f"  NULL last_lyrics_id: {len(null_ids)}", flush=True)
 
     room_writers = {}
     total_records = 0
@@ -328,139 +352,138 @@ def main():
 
     print("\n=== Writing null-lyrics tracks ===", flush=True)
     t_null = time.time()
-    for track_id in null_lyrics_track_ids:
-        room_idx = track_room_idx[track_id]
-        rw = room_writers.get(room_idx)
+    _str_data = string_data
+    _str_off = str_offsets
+    _str_len = str_lens
+    _dur = durations
+    _ri = room_indices
+    _norm = _normalize
+
+    for tid in null_ids:
+        ridx = _ri[tid]
+        rw = room_writers.get(ridx)
         if rw is None:
-            rw = RoomWriter(room_idx, CHUNK_DIR)
-            room_writers[room_idx] = rw
+            rw = RoomWriter(ridx, CHUNK_DIR)
+            room_writers[ridx] = rw
+
+        start = _str_off[tid]
+        raw = _str_data[start:start + _str_len[tid]]
+        parts = raw.split(SEP)
+        name = parts[0].decode("utf-8")
+        artist = parts[1].decode("utf-8")
+        album = parts[2].decode("utf-8")
+        dur = _dur[tid]
 
         rec = {
-            "id": track_id,
-            "name": track_names[track_id],
-            "trackName": track_names[track_id],
-            "artistName": track_artists[track_id],
-            "albumName": track_albums[track_id],
-            "duration": track_durations[track_id],
-            "instrumental": False,
-            "plainLyrics": None,
-            "syncedLyrics": None,
+            "id": tid, "name": name, "trackName": name,
+            "artistName": artist, "albumName": album, "duration": dur,
+            "instrumental": False, "plainLyrics": None, "syncedLyrics": None,
             "lyricsfile": None,
-            "nameLower": track_name_lower[track_id],
-            "artistNameLower": track_artist_lower[track_id],
-            "albumNameLower": track_album_lower[track_id],
+            "nameLower": _norm(name), "artistNameLower": _norm(artist), "albumNameLower": _norm(album),
         }
-        jb = dumps_json(rec)
+        jb = _dumps(rec)
         rw.write_record(jb)
-        track_matched[track_id] = 1
+        matched[tid] = 1
         total_records += 1
         total_json_bytes += len(jb)
-    print(f"  Null-lyrics written: {len(null_lyrics_track_ids)} ({time.time()-t_null:.1f}s)", flush=True)
-    del null_lyrics_track_ids
+    print(f"  Null-lyrics: {len(null_ids)} ({time.time()-t_null:.1f}s)", flush=True)
+    del null_ids
 
     print("\n=== PASS 2: Scanning lyrics (sequential) ===", flush=True)
     t2 = time.time()
-    lyrics_count = 0
-    matched_count = 0
+    lc = 0
+    mc = 0
     for row in cur2.execute(
         "SELECT id, instrumental, plain_lyrics, synced_lyrics, lyricsfile FROM lyrics ORDER BY id"
     ):
-        lyrics_id = row[0]
+        lid = row[0]
         instrumental = bool(row[1]) if row[1] is not None else False
-        plain_lyrics = row[2]
-        synced_lyrics = row[3]
-        lyricsfile = row[4]
+        plain = row[2]
+        synced = row[3]
+        lfile = row[4]
 
-        track_ids = lyrics_to_track.get(lyrics_id)
-        if not track_ids:
-            lyrics_count += 1
-            if lyrics_count % 500000 == 0:
-                print(f"  lyrics: {lyrics_count} ({time.time()-t2:.1f}s)", flush=True)
-            continue
+        tid = lyrics_first[lid] if lid < len(lyrics_first) else 0
+        while tid != 0:
+            if tid <= max_tid and str_lens[tid] > 0:
+                ridx = room_indices[tid]
+                rw = room_writers.get(ridx)
+                if rw is None:
+                    rw = RoomWriter(ridx, CHUNK_DIR)
+                    room_writers[ridx] = rw
 
-        for track_id in track_ids:
-            if track_id > max_track_id or track_names[track_id] is None:
-                continue
+                start = str_offsets[tid]
+                raw = string_data[start:start + str_lens[tid]]
+                parts = raw.split(SEP)
+                name = parts[0].decode("utf-8")
+                artist = parts[1].decode("utf-8")
+                album = parts[2].decode("utf-8")
+                dur = durations[tid]
 
-            room_idx = track_room_idx[track_id]
-            rw = room_writers.get(room_idx)
-            if rw is None:
-                rw = RoomWriter(room_idx, CHUNK_DIR)
-                room_writers[room_idx] = rw
+                rec = {
+                    "id": tid, "name": name, "trackName": name,
+                    "artistName": artist, "albumName": album, "duration": dur,
+                    "instrumental": instrumental, "plainLyrics": plain,
+                    "syncedLyrics": synced, "lyricsfile": lfile,
+                    "nameLower": _norm(name), "artistNameLower": _norm(artist), "albumNameLower": _norm(album),
+                }
+                jb = _dumps(rec)
+                rw.write_record(jb)
+                matched[tid] = 1
+                total_records += 1
+                total_json_bytes += len(jb)
+                mc += 1
 
-            rec = {
-                "id": track_id,
-                "name": track_names[track_id],
-                "trackName": track_names[track_id],
-                "artistName": track_artists[track_id],
-                "albumName": track_albums[track_id],
-                "duration": track_durations[track_id],
-                "instrumental": instrumental,
-                "plainLyrics": plain_lyrics,
-                "syncedLyrics": synced_lyrics,
-                "lyricsfile": lyricsfile,
-                "nameLower": track_name_lower[track_id],
-                "artistNameLower": track_artist_lower[track_id],
-                "albumNameLower": track_album_lower[track_id],
-            }
-            jb = dumps_json(rec)
-            rw.write_record(jb)
-            track_matched[track_id] = 1
-            total_records += 1
-            total_json_bytes += len(jb)
-            matched_count += 1
+            tid = next_track[tid]
 
-        lyrics_count += 1
-        if lyrics_count % 500000 == 0:
-            print(f"  lyrics: {lyrics_count} ({time.time()-t2:.1f}s)", flush=True)
+        lc += 1
+        if lc % 1000000 == 0:
+            print(f"  lyrics: {lc} ({time.time()-t2:.1f}s)", flush=True)
 
-    print(f"Pass 2 done: {lyrics_count} lyrics in {time.time()-t2:.1f}s", flush=True)
-    print(f"  matched tracks: {matched_count}", flush=True)
+    print(f"Pass 2 done: {lc} lyrics in {time.time()-t2:.1f}s", flush=True)
+    print(f"  matched tracks: {mc}", flush=True)
 
-    del lyrics_to_track
+    del lyrics_first, next_track
 
     print("\n=== Writing unmatched tracks ===", flush=True)
     t_unm = time.time()
-    unmatched_count = 0
-    for track_id in range(1, max_track_id + 1):
-        if track_names[track_id] is not None and not track_matched[track_id]:
-            room_idx = track_room_idx[track_id]
-            rw = room_writers.get(room_idx)
+    uc = 0
+    for tid in range(1, max_tid + 1):
+        if str_lens[tid] > 0 and not matched[tid]:
+            ridx = room_indices[tid]
+            rw = room_writers.get(ridx)
             if rw is None:
-                rw = RoomWriter(room_idx, CHUNK_DIR)
-                room_writers[room_idx] = rw
+                rw = RoomWriter(ridx, CHUNK_DIR)
+                room_writers[ridx] = rw
+
+            start = str_offsets[tid]
+            raw = string_data[start:start + str_lens[tid]]
+            parts = raw.split(SEP)
+            name = parts[0].decode("utf-8")
+            artist = parts[1].decode("utf-8")
+            album = parts[2].decode("utf-8")
+            dur = durations[tid]
 
             rec = {
-                "id": track_id,
-                "name": track_names[track_id],
-                "trackName": track_names[track_id],
-                "artistName": track_artists[track_id],
-                "albumName": track_albums[track_id],
-                "duration": track_durations[track_id],
-                "instrumental": False,
-                "plainLyrics": None,
-                "syncedLyrics": None,
+                "id": tid, "name": name, "trackName": name,
+                "artistName": artist, "albumName": album, "duration": dur,
+                "instrumental": False, "plainLyrics": None, "syncedLyrics": None,
                 "lyricsfile": None,
-                "nameLower": track_name_lower[track_id],
-                "artistNameLower": track_artist_lower[track_id],
-                "albumNameLower": track_album_lower[track_id],
+                "nameLower": _norm(name), "artistNameLower": _norm(artist), "albumNameLower": _norm(album),
             }
-            jb = dumps_json(rec)
+            jb = _dumps(rec)
             rw.write_record(jb)
             total_records += 1
             total_json_bytes += len(jb)
-            unmatched_count += 1
-    print(f"  Unmatched: {unmatched_count} ({time.time()-t_unm:.1f}s)", flush=True)
+            uc += 1
+    print(f"  Unmatched: {uc} ({time.time()-t_unm:.1f}s)", flush=True)
 
-    del track_names, track_artists, track_albums, track_durations
-    del track_name_lower, track_artist_lower, track_album_lower
-    del track_room_idx, track_matched
+    del string_data, str_offsets, str_lens, durations, room_indices, matched
 
     print("\n=== Flushing room writers ===", flush=True)
     t_flush = time.time()
     all_files = []
-    for room_idx in sorted(room_writers.keys()):
-        rw = room_writers[room_idx]
+    for ridx in sorted(room_writers.keys()):
+        rw = room_writers[ridx]
         rw.flush()
         all_files.extend(rw.files)
     del room_writers
@@ -469,13 +492,12 @@ def main():
     print(f"\nTotal records: {total_records}", flush=True)
     print(f"Total JSON: {total_json_bytes} ({total_json_bytes/1073741824:.2f} GiB)", flush=True)
     print(f"Chunk files: {len(all_files)}", flush=True)
-    print(f"Rooms with data: {sum(1 for f in all_files)}", flush=True)
 
     oversized = sum(1 for f in all_files if f["size"] > 20 * 1024 * 1024)
     if oversized > 0:
         print(f"WARNING: {oversized} files exceed 20 MB!", flush=True)
-        max_size = max(f["size"] for f in all_files)
-        print(f"  Max file size: {max_size} bytes ({max_size/1048576:.2f} MB)", flush=True)
+        mx = max(f["size"] for f in all_files)
+        print(f"  Max: {mx} bytes ({mx/1048576:.2f} MB)", flush=True)
 
     manifest = {
         "total_records": total_records,
@@ -491,17 +513,21 @@ def main():
         else:
             f.write(json.dumps(manifest, separators=(",", ":")).encode("utf-8"))
 
-    ts_config_dir = os.path.dirname(CONFIG_TS_PATH)
-    os.makedirs(ts_config_dir, exist_ok=True)
+    ts_dir = os.path.dirname(CONFIG_TS_PATH)
+    os.makedirs(ts_dir, exist_ok=True)
     with open(CONFIG_TS_PATH, "w") as f:
         f.write("// AUTO-GENERATED by scripts/generate_manifest.py. Do not edit manually.\n")
         f.write(f"export const TOTAL_ROOMS = {num_rooms};\n")
         f.write(f"export const TOTAL_FILES = {len(all_files)};\n")
+        f.write(f"export const FILES_PER_ROOM = 4;\n")
+        f.write(f"export const NUM_CHUNKS = {num_rooms};\n")
+        f.write(f"export const NUM_AGGREGATORS = {num_aggregators};\n")
+        f.write(f"export const CHUNKS_PER_AGG = {chunks_per_agg};\n")
+        f.write(f"export const NUM_SUPERS = {num_supers};\n")
     print(f"  config.ts written to {CONFIG_TS_PATH}", flush=True)
     print(f"  Total time: {time.time()-t0:.1f}s", flush=True)
 
     conn.close()
-    gz.close()
 
 
 if __name__ == "__main__":

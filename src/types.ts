@@ -35,7 +35,7 @@ export function hashPartition(artistName: string, trackName: string, numChunks: 
 }
 
 export const DEFAULT_SEARCH_LIMIT = 20;
-export const MAX_SEARCH_LIMIT = 50;
+export const MAX_SEARCH_LIMIT = 100;
 
 export function toApiResponse(rec: LyricRecord): Omit<LyricRecord, "nameLower" | "artistNameLower" | "albumNameLower"> {
   return {

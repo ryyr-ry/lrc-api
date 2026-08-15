@@ -1,5 +1,6 @@
 import type { LyricRecord } from "./types";
 import { prepareInput, toApiResponse, DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT } from "./types";
+import { FILES_PER_ROOM } from "./config";
 import type { Request as PartyRequest, Room, Server } from "partykit/server";
 
 export default class ChunkServer implements Server {
@@ -26,7 +27,7 @@ export default class ChunkServer implements Server {
     }
 
     const t0 = Date.now();
-    for (let part = 0; ; part++) {
+    for (let part = 0; part < FILES_PER_ROOM; part++) {
       const path = `/data/chunk-${this.chunkIndex}-${part}.json`;
       try {
         const res = await this.room.context.assets.fetch(path);

@@ -1,9 +1,7 @@
 import { hashPartition, MAX_SEARCH_LIMIT } from "./types";
-import { TOTAL_ROOMS } from "./config";
+import { TOTAL_ROOMS, NUM_SUPERS } from "./config";
 import type { Request as PartyRequest, FetchLobby, Cron, CronLobby, PartyKitServer } from "partykit/server";
 import type { ExecutionContext as CFExecutionContext } from "@cloudflare/workers-types";
-
-const NUM_SUPERS = 10;
 
 function getSuperId(query: string): string {
   let hash = 0;
