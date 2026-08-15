@@ -11,6 +11,7 @@ Usage:
 
 import struct
 import os
+import time
 from typing import Iterator, Optional
 
 
@@ -19,29 +20,16 @@ class SQLitePageParser:
         from rapidgzip import RapidgzipFile
         self.gz_path = gz_path
         self.gz = RapidgzipFile(gz_path, parallelization=parallelization or os.cpu_count())
-        self.gz_seq = None
-        self._sequential_mode = False
-        self._seq_buf = bytearray()
-        self._seq_buf_pos = 0
         self.page_size = 0
         self.reserved_size = 0
         self.usable_size = 0
         self.page_count = 0
         self.text_encoding = 1
+        self._seq_buf = bytearray()
+        self._seq_buf_pos = 0
+        self._sequential_mode = False
+        self._seq_file_pos = 0
         self._read_header()
-
-    def enable_sequential_mode(self):
-        self._sequential_mode = True
-        from rapidgzip import RapidgzipFile
-        self.gz_seq = RapidgzipFile(self.gz_path, parallelization=os.cpu_count())
-        print("Building index for sequential reader (seek to end)...", flush=True)
-        import time
-        t0 = time.time()
-        self.gz_seq.seek(0, 2)
-        print(f"Sequential reader index built in {time.time()-t0:.1f}s", flush=True)
-
-    def _get_seek_handle(self):
-        return self.gz
 
     def _read_header(self):
         header = self._read_exact(100)
@@ -63,24 +51,27 @@ class SQLitePageParser:
         self.text_encoding = struct.unpack(">I", header[56:60])[0]
 
     def build_index(self):
+        t0 = time.time()
         self.gz.seek(0, 2)
+        print(f"Index built in {time.time()-t0:.1f}s", flush=True)
+
+    def enable_sequential_mode(self):
+        self._sequential_mode = True
 
     def seek_to_beginning(self):
-        if self.gz_seq is not None:
-            self.gz_seq.seek(0)
-        else:
-            self.gz.seek(0)
+        self.gz.seek(0)
         self._seq_buf = bytearray()
         self._seq_buf_pos = 0
+        self._seq_file_pos = 0
 
     def read_sequential_page(self) -> bytes:
         ps = self.page_size
         if self._seq_buf_pos + ps <= len(self._seq_buf):
             page = bytes(self._seq_buf[self._seq_buf_pos:self._seq_buf_pos + ps])
             self._seq_buf_pos += ps
+            self._seq_file_pos += ps
             return page
 
-        fh = self.gz_seq if self.gz_seq is not None else self.gz
         remaining = ps
         page = bytearray()
 
@@ -91,7 +82,7 @@ class SQLitePageParser:
         CHUNK = 4 * 1024 * 1024
         while remaining > 0:
             to_read = max(CHUNK, remaining)
-            chunk = fh.read(to_read)
+            chunk = self.gz.read(to_read)
             if not chunk:
                 page.extend(b"\x00" * remaining)
                 break
@@ -104,6 +95,7 @@ class SQLitePageParser:
                 page.extend(chunk)
                 remaining -= len(chunk)
 
+        self._seq_file_pos += ps
         return bytes(page)
 
     def _read_exact(self, n: int) -> bytes:
@@ -120,46 +112,39 @@ class SQLitePageParser:
 
     def read_page(self, page_num: int) -> bytes:
         offset = (page_num - 1) * self.page_size
+
         if self._sequential_mode:
-            fh = self._get_seek_handle()
+            saved_pos = self._seq_file_pos
+            self.gz.seek(offset)
+            buf = bytearray()
+            remaining = self.page_size
+            while remaining > 0:
+                chunk = self.gz.read(remaining)
+                if not chunk:
+                    buf.extend(b"\x00" * remaining)
+                    break
+                buf.extend(chunk)
+                remaining -= len(chunk)
+            self.gz.seek(saved_pos)
+            return bytes(buf)
         else:
-            fh = self.gz
-        fh.seek(offset)
-        buf = bytearray()
-        remaining = self.page_size
-        while remaining > 0:
-            chunk = fh.read(remaining)
-            if not chunk:
-                buf.extend(b"\x00" * remaining)
-                break
-            buf.extend(chunk)
-            remaining -= len(chunk)
-        return bytes(buf)
-
-    def _read_exact_at(self, offset: int, n: int) -> bytes:
-        self.gz.seek(offset)
-        return self._read_exact(n)
-
-    def iter_pages(self) -> Iterator[tuple]:
-        page_num = 1
-        while page_num <= self.page_count:
-            offset = (page_num - 1) * self.page_size
-            page_data = self._read_exact_at(offset, self.page_size)
-            bt_offset = 100 if page_num == 1 else 0
-            if len(page_data) <= bt_offset:
-                page_num += 1
-                continue
-            page_type = page_data[bt_offset]
-            yield (page_num, page_type, page_data, bt_offset)
-            page_num += 1
+            self.gz.seek(offset)
+            buf = bytearray()
+            remaining = self.page_size
+            while remaining > 0:
+                chunk = self.gz.read(remaining)
+                if not chunk:
+                    buf.extend(b"\x00" * remaining)
+                    break
+                buf.extend(chunk)
+                remaining -= len(chunk)
+            return bytes(buf)
 
     def close(self):
-        for fh in (self.gz, self.gz_seq):
-            if fh is not None:
-                try:
-                    fh.close()
-                except Exception:
-                    pass
+        try:
+            self.gz.close()
+        except Exception:
+            pass
 
 
 def decode_varint_inline(data: bytes, offset: int) -> tuple:

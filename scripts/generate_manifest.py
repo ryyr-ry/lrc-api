@@ -332,7 +332,7 @@ def main():
     lyrics_temp_file = open(LYRICS_TEMP_PATH, "wb")
     lyrics_temp_offset = 0
 
-    ring_buffer = RingBuffer(capacity=2048)
+    ring_buffer = RingBuffer(capacity=8192)
 
     parser.enable_sequential_mode()
 
