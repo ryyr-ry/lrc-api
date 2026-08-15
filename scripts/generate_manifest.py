@@ -430,13 +430,13 @@ def main():
 
                     rec_bytes = bytearray()
                     if plain is not None:
-                        rec_bytes.extend(plain.encode("utf-8"))
+                        rec_bytes.extend(str(plain).encode("utf-8"))
                     rec_bytes.append(0x00)
                     if synced is not None:
-                        rec_bytes.extend(synced.encode("utf-8"))
+                        rec_bytes.extend(str(synced).encode("utf-8"))
                     rec_bytes.append(0x00)
                     if lfile is not None:
-                        rec_bytes.extend(lfile.encode("utf-8"))
+                        rec_bytes.extend(str(lfile).encode("utf-8"))
                     rec_bytes.append(0x00)
 
                     compressed = lyrics_zctx.compress(bytes(rec_bytes))
