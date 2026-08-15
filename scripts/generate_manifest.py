@@ -334,6 +334,8 @@ def main():
 
     ring_buffer = RingBuffer(capacity=8192)
     pending_overflows = []
+    PENDING_SPILL_PATH = "/tmp/pending_overflows.bin"
+    pending_spill_file = open(PENDING_SPILL_PATH, "wb")
 
     parser.enable_sequential_mode()
 
@@ -371,7 +373,15 @@ def main():
             for cell in cells:
                 resolved = cell[5] if len(cell) >= 6 else True
                 if not resolved:
-                    pending_overflows.append(cell)
+                    rowid = cell[0]
+                    local_payload = cell[3]
+                    ovfl_page_num = cell[6]
+                    total_payload_size = cell[7]
+                    local_size = cell[8]
+                    file_offset = pending_spill_file.tell()
+                    pending_spill_file.write(struct.pack("<IQIII", local_size, rowid, ovfl_page_num, total_payload_size))
+                    pending_spill_file.write(local_payload)
+                    pending_overflows.append((rowid, ovfl_page_num, total_payload_size, local_size, file_offset))
                     continue
 
                 rowid, ncols, serial_types, payload, header_length, _ = cell[:6]
@@ -464,6 +474,7 @@ def main():
     print(f"  Pending overflows: {len(pending_overflows)}", flush=True)
 
     lyrics_temp_file.close()
+    pending_spill_file.close()
     parser.close()
 
     print(f"  lyrics temp file: {lyrics_temp_offset} bytes ({lyrics_temp_offset/1073741824:.2f} GiB)", flush=True)
@@ -474,19 +485,18 @@ def main():
         from rapidgzip import RapidgzipFile
         gz_fix = RapidgzipFile(GZIP_PATH, parallelization=os.cpu_count())
         gz_fix.seek(0, 2)
-        page_size_fix = parser.page_size
-        U_fix = parser.usable_size
+        page_size_fix = page_size
+        U_fix = U
+        spill_read = open(PENDING_SPILL_PATH, "rb")
         resolved = 0
-        for cell in pending_overflows:
-            rowid = cell[0]
-            ovfl_page_num = cell[6]
-            total_payload_size = cell[7]
-            local_payload = cell[3]
-            offset = cell[9]
-            src_page = cell[8]
+        for (rowid, ovfl_page_num, total_payload_size, local_size, file_offset) in pending_overflows:
+            spill_read.seek(file_offset)
+            hdr = spill_read.read(20)
+            _, rowid_chk, ovfl_page_num_chk, total_payload_size_chk = struct.unpack("<IQIII", hdr)
+            local_payload = spill_read.read(local_size)
 
             payload = bytearray(local_payload)
-            remaining = total_payload_size - len(local_payload)
+            remaining = total_payload_size - local_size
             current_ovfl = ovfl_page_num
             while current_ovfl != 0 and remaining > 0:
                 off_fix = (current_ovfl - 1) * page_size_fix
@@ -575,7 +585,9 @@ def main():
 
         print(f"  Resolved {resolved}/{len(pending_overflows)} in {time.time()-t_ov:.1f}s", flush=True)
         gz_fix.close()
+        spill_read.close()
         del pending_overflows
+        os.remove(PENDING_SPILL_PATH)
 
     print("\n=== Writing null-lyrics tracks ===", flush=True)
     t_null = time.time()

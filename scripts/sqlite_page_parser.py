@@ -419,7 +419,7 @@ def parse_leaf_table_cells(page_data: bytes, bt_offset: int, U: int, encoding: i
                     overflow_resolved = False
                     break
             if not overflow_resolved:
-                results.append((rowid, 0, None, bytes(payload), 0, False, ovfl_page_num, payload_size, page_data, offset))
+                results.append((rowid, 0, None, bytes(payload), 0, False, ovfl_page_num, payload_size, len(payload)))
                 continue
             payload = bytes(payload)
 
