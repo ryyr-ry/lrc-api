@@ -111,34 +111,20 @@ class SQLitePageParser:
         return bytes(buf)
 
     def read_page(self, page_num: int) -> bytes:
-        offset = (page_num - 1) * self.page_size
-
         if self._sequential_mode:
-            saved_pos = self._seq_file_pos
-            self.gz.seek(offset)
-            buf = bytearray()
-            remaining = self.page_size
-            while remaining > 0:
-                chunk = self.gz.read(remaining)
-                if not chunk:
-                    buf.extend(b"\x00" * remaining)
-                    break
-                buf.extend(chunk)
-                remaining -= len(chunk)
-            self.gz.seek(saved_pos)
-            return bytes(buf)
-        else:
-            self.gz.seek(offset)
-            buf = bytearray()
-            remaining = self.page_size
-            while remaining > 0:
-                chunk = self.gz.read(remaining)
-                if not chunk:
-                    buf.extend(b"\x00" * remaining)
-                    break
-                buf.extend(chunk)
-                remaining -= len(chunk)
-            return bytes(buf)
+            raise RuntimeError("read_page() is not available in sequential mode")
+        offset = (page_num - 1) * self.page_size
+        self.gz.seek(offset)
+        buf = bytearray()
+        remaining = self.page_size
+        while remaining > 0:
+            chunk = self.gz.read(remaining)
+            if not chunk:
+                buf.extend(b"\x00" * remaining)
+                break
+            buf.extend(chunk)
+            remaining -= len(chunk)
+        return bytes(buf)
 
     def close(self):
         try:
@@ -420,16 +406,21 @@ def parse_leaf_table_cells(page_data: bytes, bt_offset: int, U: int, encoding: i
             payload = bytearray(page_data[offset:offset+local_size])
             remaining = payload_size - local_size
             current_ovfl = ovfl_page_num
+            overflow_resolved = True
             while current_ovfl != 0 and remaining > 0:
                 if ring_buffer is not None and current_ovfl in ring_buffer:
                     ovfl_data = ring_buffer[current_ovfl]
+                    next_page = struct.unpack(">I", ovfl_data[0:4])[0]
+                    chunk = min(remaining, U - 4)
+                    payload.extend(ovfl_data[4:4+chunk])
+                    remaining -= chunk
+                    current_ovfl = next_page
                 else:
-                    ovfl_data = page_reader(current_ovfl)
-                next_page = struct.unpack(">I", ovfl_data[0:4])[0]
-                chunk = min(remaining, U - 4)
-                payload.extend(ovfl_data[4:4+chunk])
-                remaining -= chunk
-                current_ovfl = next_page
+                    overflow_resolved = False
+                    break
+            if not overflow_resolved:
+                results.append((rowid, ncols, None, None, None, ovfl_page_num, payload_size))
+                continue
             payload = bytes(payload)
 
         header_length, hvsz = decode_varint_inline(payload, 0)
@@ -442,7 +433,7 @@ def parse_leaf_table_cells(page_data: bytes, bt_offset: int, U: int, encoding: i
             h_off += stvsz
             ncols += 1
 
-        results.append((rowid, ncols, serial_types, payload, header_length))
+        results.append((rowid, ncols, serial_types, payload, header_length, True))
 
     return results
 

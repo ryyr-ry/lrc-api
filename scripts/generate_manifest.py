@@ -363,11 +363,18 @@ def main():
         if page_type == 13:
             cells = parse_leaf_table_cells(
                 page_data, bt_offset, U, encoding,
-                lambda pn: parser.read_page(pn),
+                None,
                 ring_buffer
             )
 
-            for rowid, ncols, serial_types, payload, header_length in cells:
+            for cell in cells:
+                if len(cell) == 6:
+                    rowid, ncols, serial_types, payload, header_length, resolved = cell
+                    if not resolved:
+                        continue
+                else:
+                    continue
+
                 table = classify_record(ncols, serial_types, tracks_ncols, lyrics_ncols)
 
                 if table == "skip":
