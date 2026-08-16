@@ -22,10 +22,6 @@ env:
 permissions:
   contents: write
 
-concurrency:
-  group: deploy-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
   generate:
     name: Generate chunks and upload to Releases
@@ -120,8 +116,6 @@ jobs:
 
   deploy:
     name: Deploy to PartyKit (from Releases)
-    needs: generate
-    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
