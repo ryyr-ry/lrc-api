@@ -189,9 +189,10 @@ jobs:
 
       - name: Decompress chunks to public/data
         run: |
-          cd "$CHUNK_DIR"
-          for f in *.zst; do
-            zstd -d "$f" -o "public/data/$(basename "$f" .zst)"
+          cd "$GITHUB_WORKSPACE"
+          for f in "$CHUNK_DIR"/*.zst; do
+            base=$(basename "$f" .zst)
+            zstd -d "$f" -o "public/data/$base"
             rm "$f"
           done
           echo "Decompressed files: $(ls public/data | wc -l)"
