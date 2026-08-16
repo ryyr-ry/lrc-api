@@ -135,7 +135,7 @@ def main():
     print(f"Chunk dir: {CHUNK_DIR}", flush=True)
 
     fs = ChunkVFS(MANIFEST_PATH, CHUNK_DIR)
-    fuse.FUSE(fs, MOUNT_POINT, foreground=True, nothreads=True, max_read=131072)
+    fuse.FUSE(fs, MOUNT_POINT, foreground=True, nothreads=True)
 
 
 if __name__ == "__main__":

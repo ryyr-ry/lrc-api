@@ -187,23 +187,21 @@ jobs:
       - name: Prepare public directory
         run: |
           mkdir -p public
-          rm -rf public/data
 
       - name: Mount FUSE filesystem
         run: |
-          mkdir -p "$MOUNT_POINT"
-          python scripts/fuse_vfs.py "$MANIFEST_PATH" "$CHUNK_DIR" "$MOUNT_POINT" &
+          mkdir -p public/data
+          python scripts/fuse_vfs.py "$MANIFEST_PATH" "$CHUNK_DIR" public/data &
           FUSE_PID=$!
           echo "FUSE_PID=$FUSE_PID" >> $GITHUB_ENV
           sleep 10
-          FILE_COUNT=$(ls "$MOUNT_POINT" 2>/dev/null | wc -l)
+          FILE_COUNT=$(ls public/data 2>/dev/null | wc -l)
           echo "FUSE file count: $FILE_COUNT"
           if [ "$FILE_COUNT" -eq 0 ]; then
             echo "ERROR: FUSE mount failed, no files visible"
             kill $FUSE_PID 2>/dev/null || true
             exit 1
           fi
-          ln -s "$MOUNT_POINT" public/data
 
       - name: Deploy to PartyKit
         env:
@@ -216,7 +214,7 @@ jobs:
         if: always()
         run: |
           if [ -n "$FUSE_PID" ]; then
-            fusermount -u "$MOUNT_POINT" 2>/dev/null || true
+            fusermount -u public/data 2>/dev/null || true
             kill $FUSE_PID 2>/dev/null || true
           fi
           rm -f "$MANIFEST_PATH"
