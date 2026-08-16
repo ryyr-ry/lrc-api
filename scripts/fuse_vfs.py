@@ -34,6 +34,8 @@ class ChunkVFS(fuse.Operations):
         self.chunk_dir = chunk_dir
         self.files = {}
         self.file_list = []
+        self._fh_counter = 0
+        self._open_fhs = {}
         now = int(time.time() * 1e9)
 
         for entry in self.manifest["files"]:
@@ -112,10 +114,13 @@ class ChunkVFS(fuse.Operations):
 
     @fuse.overrides(fuse.Operations)
     def open(self, path, flags):
-        return 0
+        self._fh_counter += 1
+        self._open_fhs[self._fh_counter] = path
+        return self._fh_counter
 
     @fuse.overrides(fuse.Operations)
     def release(self, path, fh):
+        self._open_fhs.pop(fh, None)
         return 0
 
     @fuse.overrides(fuse.Operations)
