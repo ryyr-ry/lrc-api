@@ -22,10 +22,6 @@ env:
 permissions:
   contents: write
 
-concurrency:
-  group: deploy-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
   generate:
     name: Generate chunks and upload to Releases

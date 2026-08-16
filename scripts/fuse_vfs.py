@@ -34,7 +34,7 @@ class ChunkVFS(fuse.Operations):
         self.chunk_dir = chunk_dir
         self.files = {}
         self.file_list = []
-        self._fh_counter = 0
+        self._fh_counter = 1
         self._open_fhs = {}
         now = int(time.time() * 1e9)
 
@@ -110,7 +110,10 @@ class ChunkVFS(fuse.Operations):
     def read(self, path, size, offset, fh):
         name = path.lstrip("/")
         content = self._get_file_content(name)
-        return content[offset:offset + size]
+        actual_size = min(size, FUSE_MAX_READ)
+        if offset >= len(content):
+            return b""
+        return content[offset:offset + actual_size]
 
     @fuse.overrides(fuse.Operations)
     def open(self, path, flags):
@@ -140,7 +143,7 @@ def main():
     print(f"Chunk dir: {CHUNK_DIR}", flush=True)
 
     fs = ChunkVFS(MANIFEST_PATH, CHUNK_DIR)
-    fuse.FUSE(fs, MOUNT_POINT, foreground=True, nothreads=True)
+    fuse.FUSE(fs, MOUNT_POINT, foreground=True, nothreads=False, max_read=FUSE_MAX_READ)
 
 
 if __name__ == "__main__":
