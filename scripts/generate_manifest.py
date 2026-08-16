@@ -336,7 +336,7 @@ def main():
     pending_overflows = []
     pending_by_ovfl_page = {}
     PENDING_SPILL_PATH = "/tmp/pending_overflows.bin"
-    pending_spill_file = open(PENDING_SPILL_PATH, "wb")
+    pending_spill_file = open(PENDING_SPILL_PATH, "wb", buffering=0)
     pending_spill_read = None
 
     parser.enable_sequential_mode()
