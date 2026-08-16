@@ -126,20 +126,11 @@ jobs:
 
           echo "Release published with $ASSET_COUNT archive parts + 2 metadata files"
 
-      - name: Trigger deploy job
-        if: success() && github.event_name == 'push'
-        run: |
-          sleep 5
-          gh workflow run "$GITHUB_WORKFLOW" --ref "$GITHUB_REF"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
   deploy:
     name: Deploy to PartyKit (from Releases)
+    needs: generate
+    if: always()
     runs-on: ubuntu-latest
-    if: |
-      !((github.event_name == 'push' && contains(github.event.head_commit.message, '[regenerate]')) ||
-        (github.event_name == 'workflow_dispatch' && github.event.inputs.regenerate == 'true'))
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
