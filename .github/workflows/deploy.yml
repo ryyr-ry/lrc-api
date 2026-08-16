@@ -123,6 +123,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
       - uses: oven-sh/setup-bun@v2
 
       - name: Install Node dependencies
@@ -145,16 +155,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install FUSE dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq libfuse-dev fuse 2>/dev/null || true
-          sudo modprobe fuse 2>/dev/null || true
-          sudo chmod 666 /dev/fuse 2>/dev/null || true
-
       - name: Install Python dependencies
         run: |
-          pip install --no-cache-dir mfusepy orjson zstandard
+          pip install --no-cache-dir zstandard
 
       - name: Download chunk archives (parallel)
         run: |
@@ -184,19 +187,14 @@ jobs:
         run: |
           mkdir -p public/data
 
-      - name: Mount FUSE filesystem
+      - name: Decompress chunks to public/data
         run: |
-          python scripts/fuse_vfs.py "$MANIFEST_PATH" "$CHUNK_DIR" public/data &
-          FUSE_PID=$!
-          echo "FUSE_PID=$FUSE_PID" >> $GITHUB_ENV
-          sleep 10
-          FILE_COUNT=$(ls public/data 2>/dev/null | wc -l)
-          echo "FUSE file count: $FILE_COUNT"
-          if [ "$FILE_COUNT" -eq 0 ]; then
-            echo "ERROR: FUSE mount failed, no files visible"
-            kill $FUSE_PID 2>/dev/null || true
-            exit 1
-          fi
+          cd "$CHUNK_DIR"
+          for f in *.zst; do
+            zstd -d "$f" -o "public/data/$(basename "$f" .zst)"
+            rm "$f"
+          done
+          echo "Decompressed files: $(ls public/data | wc -l)"
 
       - name: Deploy to PartyKit
         env:
@@ -208,9 +206,5 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          if [ -n "$FUSE_PID" ]; then
-            fusermount -u public/data 2>/dev/null || true
-            kill $FUSE_PID 2>/dev/null || true
-          fi
           rm -f "$MANIFEST_PATH"
           rm -rf "$PUBLIC_DIR" "$CHUNK_DIR"
