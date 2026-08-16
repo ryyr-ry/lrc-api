@@ -108,8 +108,7 @@ class ChunkVFS(fuse.Operations):
     def read(self, path, size, offset, fh):
         name = path.lstrip("/")
         content = self._get_file_content(name)
-        actual_size = min(size, FUSE_MAX_READ)
-        return content[offset:offset + actual_size]
+        return content[offset:offset + size]
 
     @fuse.overrides(fuse.Operations)
     def open(self, path, flags):
