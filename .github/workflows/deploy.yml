@@ -95,23 +95,15 @@ jobs:
             --notes "Auto-generated chunk archives" \
             --prerelease --draft
 
-          RELEASE_ID=$(gh api repos/"$GITHUB_REPOSITORY"/releases \
-            --jq '.[] | select(.tag_name == "'"$RELEASE_TAG"'") | .id' | tail -1)
-          UPLOAD_URL=$(gh api repos/"$GITHUB_REPOSITORY"/releases/"$RELEASE_ID" \
-            --jq '.upload_url' | sed 's/{.*}//')
-
           i=0
           while IFS= read -r group; do
               i=$((i+1))
               part=$(printf "part_%04d.tar" "$i")
               IFS=':' read -ra files <<< "$group"
-              tar cf "$part" "${files[@]}" && \
-              curl -sS -f --retry 3 -X POST "$UPLOAD_URL?name=$part" \
-                  -H "Authorization: Bearer $GH_TOKEN" \
-                  -H "Content-Type: application/octet-stream" \
-                  --data-binary @"$part" && \
+              tar cf "$part" "${files[@]}"
+              gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" "$part" --clobber
               rm -f "$part" &
-              while [ "$(jobs -r | wc -l)" -ge 5 ]; do sleep 0.5; done
+              while [ "$(jobs -r | wc -l)" -ge 2 ]; do sleep 0.5; done
           done < /tmp/file_groups
           wait
 
