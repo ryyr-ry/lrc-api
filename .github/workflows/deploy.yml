@@ -197,12 +197,19 @@ jobs:
           done
           echo "Decompressed files: $(ls public/data | wc -l)"
 
-      - name: Deploy to PartyKit
+      - name: Deploy to PartyKit via proxy
         env:
           PARTYKIT_TOKEN: ${{ secrets.PARTYKIT_TOKEN }}
           PARTYKIT_LOGIN: ${{ secrets.PARTYKIT_LOGIN }}
+          PARTYKIT_API_BASE: http://127.0.0.1:8787
         run: |
-          bunx partykit deploy
+          node scripts/api_proxy.js /tmp/proxy.log &
+          PROXY_PID=$!
+          sleep 2
+          bunx partykit deploy || true
+          kill $PROXY_PID 2>/dev/null || true
+          echo "=== PROXY LOG ==="
+          cat /tmp/proxy.log
 
       - name: Cleanup
         if: always()
