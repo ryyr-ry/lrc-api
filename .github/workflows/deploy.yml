@@ -206,9 +206,12 @@ jobs:
           PROXY_BATCH=500 PROXY_MAX_BATCH_BYTES=99614720 node scripts/api_proxy.js /tmp/proxy.log &
           PROXY_PID=$!
           sleep 2
+          set +e
           bunx partykit deploy
           DEPLOY_STATUS=$?
+          set -e
           kill $PROXY_PID 2>/dev/null || true
+          wait $PROXY_PID 2>/dev/null || true
           echo "=== PROXY LOG ==="
           cat /tmp/proxy.log
           exit $DEPLOY_STATUS
