@@ -203,7 +203,7 @@ jobs:
           PARTYKIT_LOGIN: ${{ secrets.PARTYKIT_LOGIN }}
           PARTYKIT_API_BASE: http://127.0.0.1:8787
         run: |
-          PROXY_BATCH=500 PROXY_MAX_BATCH_BYTES=99614720 node scripts/api_proxy.js /tmp/proxy.log &
+          PROXY_FAKE_SIZES=1 node scripts/api_proxy.js /tmp/proxy.log &
           PROXY_PID=$!
           sleep 2
           set +e
