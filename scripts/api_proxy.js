@@ -108,30 +108,60 @@ async function splitManifest(method, url, headers, body) {
       `(max ${BATCH} files / ${MAX_BATCH_BYTES} bytes per batch)`
   );
 
-  let idx = 0;
-  for (const batchKeys of batches) {
-    idx += 1;
-    const chunkAssets = {};
-    const chunkInfo = {};
-    let chunkBytes = 0;
-    for (const k of batchKeys) {
-      chunkAssets[k] = assets[k];
-      if (assetInfo[k]) {
-        chunkInfo[k] = assetInfo[k];
-        chunkBytes += assetInfo[k].fileSize || 0;
+  const results = new Array(batches.length);
+  const CONCURRENCY = parseInt(process.env.PROXY_CONCURRENCY || "20", 10);
+  let nextIndex = 0;
+  let firstError = null;
+  let finishedWorkers = 0;
+
+  async function worker() {
+    while (firstError === null) {
+      const idx = nextIndex++;
+      if (idx >= batches.length) return;
+      const batchKeys = batches[idx];
+      const chunkAssets = {};
+      const chunkInfo = {};
+      let chunkBytes = 0;
+      for (const k of batchKeys) {
+        chunkAssets[k] = assets[k];
+        if (assetInfo[k]) {
+          chunkInfo[k] = assetInfo[k];
+          chunkBytes += assetInfo[k].fileSize || 0;
+        }
+      }
+      const chunk = {
+        ...manifest,
+        assets: chunkAssets,
+        assetInfo: chunkInfo,
+      };
+      const res = await forward(
+        method,
+        url,
+        headers,
+        Buffer.from(JSON.stringify(chunk))
+      );
+      results[idx] = res;
+      log(
+        `SPLIT batch ${idx + 1}/${batches.length} (${batchKeys.length} files, ${chunkBytes} bytes) -> ${res.status} ${res.body
+          .toString("utf8")
+          .slice(0, 160)}`
+      );
+      if (res.status >= 400) {
+        firstError = res;
       }
     }
-    const chunk = {
-      ...manifest,
-      assets: chunkAssets,
-      assetInfo: chunkInfo,
-    };
-    const res = await forward(method, url, headers, Buffer.from(JSON.stringify(chunk)));
-    log(
-      `SPLIT batch ${idx}/${batches.length} (${batchKeys.length} files, ${chunkBytes} bytes) -> ${res.status} ${res.body
-        .toString("utf8")
-        .slice(0, 200)}`
-    );
+  }
+
+  const workers = [];
+  for (let w = 0; w < Math.min(CONCURRENCY, batches.length); w++) {
+    workers.push(worker());
+  }
+  await Promise.all(workers);
+
+  if (firstError !== null) {
+    return firstError;
+  }
+  for (const res of results) {
     if (res.status >= 400) {
       return res;
     }
