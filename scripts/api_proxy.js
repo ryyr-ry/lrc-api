@@ -131,9 +131,47 @@ function forward(method, url, headers, body) {
       }
     );
     upstream.on("error", (err) => {
+      log(`!!! upstream error on ${method} ${url}: ${err.message}`);
       resolve({ status: 502, headers: {}, body: Buffer.from(err.message) });
     });
     upstream.end(body);
+  });
+}
+
+function forwardStreaming(method, url, headers, bodyStream) {
+  return new Promise((resolve) => {
+    const target = new URL(REAL_BASE + url);
+    const transport = target.protocol === "https:" ? https : http;
+    const outHeaders = stripHopByHop(headers);
+    outHeaders.host = target.host;
+    const upstream = transport.request(
+      target,
+      { method, headers: outHeaders },
+      (upstreamRes) => {
+        let resBody = Buffer.alloc(0);
+        upstreamRes.on("data", (chunk) => {
+          resBody = Buffer.concat([resBody, chunk]);
+        });
+        upstreamRes.on("end", () => {
+          resolve({
+            status: upstreamRes.statusCode,
+            headers: stripHopByHop(upstreamRes.headers),
+            body: resBody,
+          });
+        });
+      }
+    );
+    upstream.on("error", (err) => {
+      log(`!!! upstream error on ${method} ${url}: ${err.message}`);
+      resolve({ status: 502, headers: {}, body: Buffer.from(err.message) });
+    });
+    bodyStream.on("data", (chunk) => upstream.write(chunk));
+    bodyStream.on("end", () => upstream.end());
+    bodyStream.on("error", (err) => {
+      log(`!!! body stream error on ${method} ${url}: ${err.message}`);
+      upstream.destroy();
+      resolve({ status: 502, headers: {}, body: Buffer.from(err.message) });
+    });
   });
 }
 
@@ -279,6 +317,23 @@ async function splitManifest(method, url, headers, body) {
 }
 
 const server = http.createServer((req, res) => {
+  const isStreamingPut =
+    req.method === "PUT" && req.url.includes("/assets");
+  const isManifest = isManifestEndpoint(req.method, req.url);
+
+  if (isStreamingPut) {
+    const authPresent = req.headers.authorization ? "yes" : "no";
+    log(`>>> ${req.method} ${req.url} auth=${authPresent} (streaming)`);
+    forwardStreaming(req.method, req.url, req.headers, req).then((result) => {
+      log(
+        `<<< ${req.method} ${req.url} status=${result.status} body=${result.body.length} bytes`
+      );
+      res.writeHead(result.status, result.headers);
+      res.end(result.body);
+    });
+    return;
+  }
+
   let body = Buffer.alloc(0);
   req.on("data", (chunk) => {
     body = Buffer.concat([body, chunk]);
@@ -293,7 +348,7 @@ const server = http.createServer((req, res) => {
     log(`>>> ${req.method} ${req.url} body=${body.length} auth=${authPresent}`);
 
     let result;
-    if (isManifestEndpoint(req.method, req.url) && body.length > 0) {
+    if (isManifest && body.length > 0) {
       try {
         result = await splitManifest(req.method, req.url, req.headers, body);
       } catch (err) {
