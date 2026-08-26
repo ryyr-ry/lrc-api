@@ -12,6 +12,7 @@ const REAL_BASE = process.env.PROXY_TARGET || "https://api.partykit.dev";
 const PORT = parseInt(process.env.PROXY_PORT || "8787", 10);
 const LOGFILE = process.argv[2] || "/tmp/proxy.log";
 const BATCH = parseInt(process.env.PROXY_BATCH || "500", 10);
+const MAX_BATCH_BYTES = parseInt(process.env.PROXY_MAX_BATCH_BYTES || "94371840", 10);
 
 const HOP_BY_HOP = new Set([
   "connection",
@@ -82,17 +83,43 @@ async function splitManifest(method, url, headers, body) {
   const assetInfo = manifest.assetInfo || {};
   const keys = Object.keys(assets);
 
-  log(`SPLIT ${url}: ${keys.length} assets in batches of ${BATCH}`);
+  const batches = [];
+  let currentKeys = [];
+  let currentBytes = 0;
+  for (const k of keys) {
+    const size = assetInfo[k] ? assetInfo[k].fileSize : 0;
+    if (
+      currentKeys.length > 0 &&
+      (currentKeys.length >= BATCH || currentBytes + size > MAX_BATCH_BYTES)
+    ) {
+      batches.push(currentKeys);
+      currentKeys = [];
+      currentBytes = 0;
+    }
+    currentKeys.push(k);
+    currentBytes += size;
+  }
+  if (currentKeys.length > 0) {
+    batches.push(currentKeys);
+  }
+
+  log(
+    `SPLIT ${url}: ${keys.length} assets, ${batches.length} batches ` +
+      `(max ${BATCH} files / ${MAX_BATCH_BYTES} bytes per batch)`
+  );
 
   let idx = 0;
-  for (let start = 0; start < keys.length; start += BATCH) {
+  for (const batchKeys of batches) {
     idx += 1;
-    const chunkKeys = keys.slice(start, start + BATCH);
     const chunkAssets = {};
     const chunkInfo = {};
-    for (const k of chunkKeys) {
+    let chunkBytes = 0;
+    for (const k of batchKeys) {
       chunkAssets[k] = assets[k];
-      if (assetInfo[k]) chunkInfo[k] = assetInfo[k];
+      if (assetInfo[k]) {
+        chunkInfo[k] = assetInfo[k];
+        chunkBytes += assetInfo[k].fileSize || 0;
+      }
     }
     const chunk = {
       ...manifest,
@@ -101,7 +128,7 @@ async function splitManifest(method, url, headers, body) {
     };
     const res = await forward(method, url, headers, Buffer.from(JSON.stringify(chunk)));
     log(
-      `SPLIT batch ${idx}/${Math.ceil(keys.length / BATCH)} -> ${res.status} ${res.body
+      `SPLIT batch ${idx}/${batches.length} (${batchKeys.length} files, ${chunkBytes} bytes) -> ${res.status} ${res.body
         .toString("utf8")
         .slice(0, 200)}`
     );
