@@ -13,6 +13,8 @@ const PORT = parseInt(process.env.PROXY_PORT || "8787", 10);
 const LOGFILE = process.argv[2] || "/tmp/proxy.log";
 const BATCH = parseInt(process.env.PROXY_BATCH || "500", 10);
 const MAX_BATCH_BYTES = parseInt(process.env.PROXY_MAX_BATCH_BYTES || "94371840", 10);
+const CLERK_BASE = process.env.PROXY_CLERK_BASE || "https://clerk.partykit.io";
+const CLIENT_TOKEN = process.env.PARTYKIT_TOKEN || "";
 
 const HOP_BY_HOP = new Set([
   "connection",
@@ -36,6 +38,72 @@ function stripHopByHop(headers) {
     out[key] = value;
   }
   return out;
+}
+
+let sessionIdCache = null;
+let sessionTokenCache = null;
+let sessionTokenFetchedAt = 0;
+
+async function fetchClerkJson(path, method = "GET") {
+  const url = new URL(`${CLERK_BASE}${path}`);
+  url.searchParams.set("_is_native", "1");
+  return new Promise((resolve, reject) => {
+    const transport = url.protocol === "https:" ? https : http;
+    const req = transport.request(
+      url,
+      {
+        method,
+        headers: {
+          Authorization: CLIENT_TOKEN,
+          "User-Agent": "partykit-split-proxy",
+        },
+      },
+      (res) => {
+        let body = Buffer.alloc(0);
+        res.on("data", (c) => (body = Buffer.concat([body, c])));
+        res.on("end", () => {
+          try {
+            resolve({ status: res.statusCode, json: JSON.parse(body.toString("utf8")) });
+          } catch (e) {
+            reject(new Error(`clerk json parse: ${e.message}`));
+          }
+        });
+      }
+    );
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+async function getFreshSessionToken() {
+  const now = Date.now();
+  if (sessionTokenCache && now - sessionTokenFetchedAt < 30000) {
+    return sessionTokenCache;
+  }
+  if (!sessionIdCache) {
+    const clientRes = await fetchClerkJson("/v1/client");
+    if (clientRes.status !== 200) {
+      throw new Error(`clerk client fetch failed: ${clientRes.status}`);
+    }
+    sessionIdCache =
+      clientRes.json?.response?.last_active_session_id ||
+      clientRes.json?.client?.sessions?.[0]?.id ||
+      null;
+    if (!sessionIdCache) {
+      throw new Error("no active clerk session found");
+    }
+  }
+  const tokenRes = await fetchClerkJson(
+    `/v1/client/sessions/${sessionIdCache}/tokens`,
+    "POST"
+  );
+  if (tokenRes.status !== 200 || !tokenRes.json?.jwt) {
+    sessionIdCache = null;
+    throw new Error(`clerk token fetch failed: ${tokenRes.status}`);
+  }
+  sessionTokenCache = tokenRes.json.jwt;
+  sessionTokenFetchedAt = now;
+  return sessionTokenCache;
 }
 
 function forward(method, url, headers, body) {
@@ -77,11 +145,48 @@ function isManifestEndpoint(method, url) {
   );
 }
 
+async function forwardWithTokenRefresh(method, url, headers, body) {
+  let res = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let authHeaders = headers;
+    if (CLIENT_TOKEN) {
+      try {
+        const freshToken = await getFreshSessionToken();
+        authHeaders = {
+          ...headers,
+          authorization: `Bearer ${freshToken}`,
+        };
+      } catch (e) {
+        log(`!!! clerk token refresh failed: ${e.message}`);
+      }
+    }
+    res = await forward(method, url, authHeaders, body);
+    if (res.status === 401 && CLIENT_TOKEN && attempt === 0) {
+      sessionTokenCache = null;
+      log(`!!! 401 on batch, retrying with fresh token`);
+      continue;
+    }
+    return res;
+  }
+  return res;
+}
+
+const FAKE_SIZES = process.env.PROXY_FAKE_SIZES === "1";
+
 async function splitManifest(method, url, headers, body) {
   const manifest = JSON.parse(body.toString("utf8"));
   const assets = manifest.assets || {};
   const assetInfo = manifest.assetInfo || {};
   const keys = Object.keys(assets);
+
+  if (FAKE_SIZES) {
+    for (const k of keys) {
+      if (assetInfo[k]) {
+        assetInfo[k] = { ...assetInfo[k], fileSize: 1 };
+      }
+    }
+    log(`FAKE_SIZES ${url}: ${keys.length} assets, all fileSize set to 1`);
+  }
 
   const batches = [];
   let currentKeys = [];
@@ -134,7 +239,7 @@ async function splitManifest(method, url, headers, body) {
         assets: chunkAssets,
         assetInfo: chunkInfo,
       };
-      const res = await forward(
+      const res = await forwardWithTokenRefresh(
         method,
         url,
         headers,
