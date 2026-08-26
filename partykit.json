@@ -3,7 +3,7 @@
   "main": "src/server.ts",
   "serve": { "path": "public" },
   "crons": {
-    "warm": "*/5 * * * *"
+    "warm": "* * * * *"
   },
   "parties": {
     "chunk": "src/chunk.ts",

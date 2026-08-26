@@ -14,17 +14,19 @@ export default class AggregatorServer implements Server {
   async onRequest(req: PartyRequest): Promise<Response> {
     const url = new URL(req.url);
     const path = url.pathname;
+    const segments = path.split("/");
+    const route = segments[segments.length - 1];
     const isSuper = this.room.id.startsWith("super-");
 
-    if (path === "/warm") {
+    if (route === "warm") {
       return new Response("OK", { status: 200 });
     }
 
-    if (path === "/search") {
+    if (route === "search") {
       return this.handleSearch(url, isSuper);
     }
 
-    if (path === "/search-lyrics") {
+    if (route === "search-lyrics") {
       return this.handleSearchLyrics(url, isSuper);
     }
 

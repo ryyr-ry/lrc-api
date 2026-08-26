@@ -50,12 +50,14 @@ export default class IndexServer implements Server {
   async onRequest(req: PartyRequest): Promise<Response> {
     const url = new URL(req.url);
     const path = url.pathname;
+    const segments = path.split("/");
+    const route = segments[segments.length - 1];
 
-    if (path === "/warm") {
+    if (route === "warm") {
       return new Response("OK", { status: 200 });
     }
 
-    if (path === "/info") {
+    if (route === "info") {
       return new Response(
         JSON.stringify({
           loaded: this.loaded,
@@ -66,7 +68,7 @@ export default class IndexServer implements Server {
       );
     }
 
-    if (path === "/lookup") {
+    if (route === "lookup") {
       if (!this.lookup) {
         return new Response(JSON.stringify({ error: "Index not loaded" }), {
           status: 503,

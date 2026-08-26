@@ -48,12 +48,14 @@ export default class ChunkServer implements Server {
   async onRequest(req: PartyRequest): Promise<Response> {
     const url = new URL(req.url);
     const path = url.pathname;
+    const segments = path.split("/");
+    const route = segments[segments.length - 1];
 
-    if (path === "/warm") {
+    if (route === "warm") {
       return new Response("OK", { status: 200 });
     }
 
-    if (path === "/info") {
+    if (route === "info") {
       return new Response(
         JSON.stringify({
           chunk: this.chunkIndex,
@@ -65,19 +67,19 @@ export default class ChunkServer implements Server {
       );
     }
 
-    if (path === "/get") {
+    if (route === "get") {
       return this.handleGet(url);
     }
 
-    if (path === "/get-by-id") {
+    if (route === "get-by-id") {
       return this.handleGetById(url);
     }
 
-    if (path === "/search") {
+    if (route === "search") {
       return this.handleSearch(url);
     }
 
-    if (path === "/search-lyrics") {
+    if (route === "search-lyrics") {
       return this.handleSearchLyrics(url);
     }
 
