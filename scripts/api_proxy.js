@@ -209,6 +209,21 @@ async function forwardWithTokenRefresh(method, url, headers, body) {
   return res;
 }
 
+async function forwardWithRetry(method, url, headers, body) {
+  let res = null;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    res = await forwardWithTokenRefresh(method, url, headers, body);
+    if (res.status === 429 || res.status >= 500) {
+      const backoff = 1000 * Math.pow(2, attempt) + Math.random() * 500;
+      log(`!!! ${res.status} on ${method} ${url}, retrying in ${Math.round(backoff)}ms (attempt ${attempt + 1}/5)`);
+      await new Promise((r) => setTimeout(r, backoff));
+      continue;
+    }
+    return res;
+  }
+  return res;
+}
+
 const FAKE_SIZES = process.env.PROXY_FAKE_SIZES === "1";
 
 async function splitManifest(method, url, headers, body) {
@@ -252,7 +267,7 @@ async function splitManifest(method, url, headers, body) {
   );
 
   const results = new Array(batches.length);
-  const CONCURRENCY = parseInt(process.env.PROXY_CONCURRENCY || "20", 10);
+  const CONCURRENCY = parseInt(process.env.PROXY_CONCURRENCY || "6", 10);
   let nextIndex = 0;
   let firstError = null;
   let finishedWorkers = 0;
@@ -277,7 +292,7 @@ async function splitManifest(method, url, headers, body) {
         assets: chunkAssets,
         assetInfo: chunkInfo,
       };
-      const res = await forwardWithTokenRefresh(
+      const res = await forwardWithRetry(
         method,
         url,
         headers,
