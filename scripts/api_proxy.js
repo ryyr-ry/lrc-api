@@ -334,6 +334,20 @@ async function splitManifest(method, url, headers, body) {
 const server = http.createServer((req, res) => {
   const isManifest = isManifestEndpoint(req.method, req.url);
 
+  if (req.method === "PUT" && req.url.includes("/assets")) {
+    const authPresent = req.headers.authorization ? "yes" : "no";
+    log(`>>> ${req.method} ${req.url} auth=${authPresent} (streaming)`);
+    forwardStreaming(req.method, req.url, req.headers, req).then((result) => {
+      const preview = result.body.toString("utf8").slice(0, 200);
+      log(
+        `<<< ${req.method} ${req.url} status=${result.status} body=${result.body.length} bytes: ${preview}`
+      );
+      res.writeHead(result.status, result.headers);
+      res.end(result.body);
+    });
+    return;
+  }
+
   let body = Buffer.alloc(0);
   req.on("data", (chunk) => {
     body = Buffer.concat([body, chunk]);
@@ -355,8 +369,6 @@ const server = http.createServer((req, res) => {
         log(`!!! manifest split parse error: ${err.message}`);
         result = await forwardWithRetry(req.method, req.url, req.headers, body);
       }
-    } else if (req.method === "PUT") {
-      result = await forwardWithRetry(req.method, req.url, req.headers, body);
     } else {
       result = await forward(req.method, req.url, req.headers, body);
     }
