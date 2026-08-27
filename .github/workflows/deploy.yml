@@ -197,26 +197,12 @@ jobs:
           done
           echo "Decompressed files: $(ls public/data | wc -l)"
 
-      - name: Deploy to PartyKit via split proxy
+      - name: Deploy to PartyKit (direct)
         env:
           PARTYKIT_TOKEN: ${{ secrets.PARTYKIT_TOKEN }}
           PARTYKIT_LOGIN: ${{ secrets.PARTYKIT_LOGIN }}
-          PARTYKIT_API_BASE: http://127.0.0.1:8787
         run: |
-          PROXY_BATCH=500 PROXY_MAX_BATCH_BYTES=99614720 PROXY_CONCURRENCY=6 node scripts/api_proxy.js /tmp/proxy.log 2>/tmp/proxy.err &
-          PROXY_PID=$!
-          sleep 2
-          set +e
-          bunx partykit deploy
-          DEPLOY_STATUS=$?
-          set -e
-          kill $PROXY_PID 2>/dev/null || true
-          wait $PROXY_PID 2>/dev/null || true
-          echo "=== PROXY ERR ==="
-          cat /tmp/proxy.err 2>/dev/null
-          echo "=== PROXY LOG ==="
-          cat /tmp/proxy.log
-          exit $DEPLOY_STATUS
+          node scripts/deploy_direct.js
 
       - name: Cleanup
         if: always()

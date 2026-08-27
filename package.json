@@ -10,6 +10,8 @@
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4",
-    "typescript": "^5"
+    "esbuild": "^0.28.2",
+    "typescript": "^5",
+    "unenv": "^1.10.0"
   }
 }
