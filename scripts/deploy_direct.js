@@ -393,21 +393,16 @@ ${partyImports}
 }
 
 function buildFinalForm(code, manifest) {
-  const boundary = "----lrc-deploy-" + crypto.randomBytes(8).toString("hex");
-  const parts = [];
-  const field = (name, value) => {
-    parts.push(
-      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`)
-    );
-  };
-  field("code", code);
+  const { FormData, File } = require("undici");
+  const form = new FormData();
+  form.set("code", code);
   if (config.parties) {
-    field("parties", JSON.stringify(Object.keys(config.parties)));
+    form.set("parties", JSON.stringify(Object.keys(config.parties)));
   }
   if (config.crons) {
-    field("crons", JSON.stringify(config.crons));
+    form.set("crons", JSON.stringify(config.crons));
   }
-  field("staticAssetsManifest", JSON.stringify(manifest));
+  form.set("staticAssetsManifest", JSON.stringify(manifest));
   const baseNodeBuiltins = [
     "assert", "async_hooks", "buffer", "diagnostics_channel", "events",
     "path", "stream", "string_decoder", "util", "crypto",
@@ -415,26 +410,41 @@ function buildFinalForm(code, manifest) {
   for (const name of baseNodeBuiltins) {
     const fileName = `upload/partykit-exposed-node-${name}`;
     const content = `export * from 'node:${name}';export { default } from 'node:${name}';`;
-    parts.push(
-      Buffer.from(
-        `--${boundary}\r\nContent-Disposition: form-data; name="${fileName}"\r\nContent-Type: application/javascript+module\r\n\r\n${content}\r\n`
-      )
+    form.set(
+      fileName,
+      new File([content], fileName, { type: "application/javascript+module" })
     );
   }
   for (const cfName of ["email", "sockets"]) {
     const fileName = `upload/partykit-exposed-cloudflare-${cfName}`;
     const content = `export * from 'cloudflare:${cfName}';`;
-    parts.push(
-      Buffer.from(
-        `--${boundary}\r\nContent-Disposition: form-data; name="${fileName}"\r\nContent-Type: application/javascript+module\r\n\r\n${content}\r\n`
-      )
+    form.set(
+      fileName,
+      new File([content], fileName, { type: "application/javascript+module" })
     );
   }
-  parts.push(Buffer.from(`--${boundary}--\r\n`));
-  return {
-    body: Buffer.concat(parts),
-    contentType: `multipart/form-data; boundary=${boundary}`,
-  };
+  return form;
+}
+
+async function finalDeployRequest(form) {
+  const { fetch } = require("undici");
+  const token = await getSessionToken();
+  const res = await fetch(
+    `${API_BASE}/parties/${LOGIN}/${projectName}`,
+    {
+      method: "POST",
+      body: form,
+      headers: {
+        Accept: "application/json",
+        "User-Agent": "partykit/0.0.115",
+        "X-PartyKit-Version": "0.0.115",
+        "X-PartyKit-User-Type": "clerk",
+        Authorization: `Bearer ${token}`,
+      },
+    }
+  );
+  const text = await res.text();
+  return { status: res.status, body: Buffer.from(text) };
 }
 
 async function main() {
@@ -481,12 +491,7 @@ async function main() {
 
   log("final deploy POST...");
   const form = buildFinalForm(code, manifest);
-  const deployRes = await apiRequest(
-    "POST",
-    `/parties/${LOGIN}/${projectName}`,
-    { "Content-Type": form.contentType },
-    form.body
-  );
+  const deployRes = await finalDeployRequest(form);
   log(`deploy response: ${deployRes.status} ${deployRes.body.toString("utf8").slice(0, 300)}`);
   if (deployRes.status >= 400) {
     process.exit(1);
