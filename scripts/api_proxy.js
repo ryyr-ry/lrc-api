@@ -155,40 +155,96 @@ function forward(method, url, headers, body) {
 }
 
 let pendingPutTransfers = [];
-let putQueue = [];
-let putQueueRunning = 0;
+let putStreamActive = 0;
+let putStreamWaiters = [];
 const PUT_CONCURRENCY = parseInt(process.env.PROXY_PUT_CONCURRENCY || "8", 10);
 
-async function pumpPutQueue() {
-  while (putQueueRunning < PUT_CONCURRENCY && putQueue.length > 0) {
-    const job = putQueue.shift();
-    putQueueRunning += 1;
-    job()
-      .catch((err) => {
-        log(`!!! put queue job error: ${err.message}`);
-      })
-      .finally(() => {
-        putQueueRunning -= 1;
-        pumpPutQueue();
-      });
+async function acquirePutSlot() {
+  if (putStreamActive < PUT_CONCURRENCY) {
+    putStreamActive += 1;
+    return;
+  }
+  await new Promise((resolve) => putStreamWaiters.push(resolve));
+}
+
+function releasePutSlot() {
+  putStreamActive -= 1;
+  const next = putStreamWaiters.shift();
+  if (next) {
+    putStreamActive += 1;
+    next();
   }
 }
 
-function enqueuePut(method, url, headers, body) {
+function forwardStreamingPut(method, url, headers, bodyStream, clientRes) {
   return new Promise((resolve) => {
-    const job = async () => {
-      const res = await forwardWithRetry(method, url, headers, body);
-      if (res.status >= 400) {
-        log(
-          `!!! PUT failed after retries ${url}: status=${res.status} body=${safePreview(res.body, 160)}`
-        );
-      } else {
-        log(`!!! PUT background ok ${url}: status=${res.status}`);
-      }
-      resolve(res);
+    let started = false;
+    const startTransfer = () => {
+      const target = new URL(REAL_BASE + url);
+      const transport = target.protocol === "https:" ? https : http;
+      const outHeaders = stripHopByHop(headers);
+      outHeaders.host = target.host;
+      let earlyResponded = false;
+      const upstream = transport.request(
+        target,
+        { method, headers: outHeaders },
+        (upstreamRes) => {
+          let resBody = Buffer.alloc(0);
+          upstreamRes.on("data", (chunk) => {
+            resBody = Buffer.concat([resBody, chunk]);
+          });
+          upstreamRes.on("end", () => {
+            if (earlyResponded) {
+              log(
+                `!!! PUT background result ${url}: status=${upstreamRes.statusCode} body=${safePreview(resBody, 120)}`
+              );
+            }
+            releasePutSlot();
+            resolve({
+              status: upstreamRes.statusCode,
+              headers: stripHopByHop(upstreamRes.headers),
+              body: resBody,
+              alreadySent: earlyResponded,
+            });
+          });
+        }
+      );
+      upstream.on("error", (err) => {
+        log(`!!! upstream error on PUT ${url}: ${err.message}`);
+        releasePutSlot();
+        resolve({
+          status: 502,
+          headers: {},
+          body: Buffer.from(err.message),
+          alreadySent: earlyResponded,
+        });
+      });
+      bodyStream.on("data", (chunk) => {
+        upstream.write(chunk);
+        if (!earlyResponded) {
+          earlyResponded = true;
+          clientRes.writeHead(200, { "Content-Type": "application/json" });
+          clientRes.end('{"success":true}');
+        }
+      });
+      bodyStream.on("end", () => upstream.end());
+      bodyStream.on("error", (err) => {
+        log(`!!! body stream error on PUT ${url}: ${err.message}`);
+        upstream.destroy();
+        if (!earlyResponded) {
+          releasePutSlot();
+          resolve({
+            status: 502,
+            headers: {},
+            body: Buffer.from(err.message),
+          });
+        }
+      });
     };
-    putQueue.push(job);
-    pumpPutQueue();
+    acquirePutSlot().then(() => {
+      started = true;
+      startTransfer();
+    });
   });
 }
 
@@ -382,26 +438,20 @@ const server = http.createServer((req, res) => {
   }
 
   if (req.method === "PUT" && req.url.includes("/assets")) {
-    let putBody = Buffer.alloc(0);
-    req.on("data", (chunk) => {
-      putBody = Buffer.concat([putBody, chunk]);
+    const transferPromise = forwardStreamingPut(
+      req.method,
+      req.url,
+      req.headers,
+      req,
+      res
+    ).then((result) => {
+      if (result.alreadySent) {
+        return;
+      }
+      res.writeHead(result.status, result.headers);
+      res.end(result.body);
     });
-    req.on("error", (err) => {
-      log(`!!! client error on PUT ${req.url}: ${err.message}`);
-      res.writeHead(400);
-      res.end();
-    });
-    req.on("end", () => {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end('{"success":true}');
-      const transferPromise = enqueuePut(
-        req.method,
-        req.url,
-        req.headers,
-        putBody
-      );
-      pendingPutTransfers.push(transferPromise);
-    });
+    pendingPutTransfers.push(transferPromise);
     return;
   }
 
