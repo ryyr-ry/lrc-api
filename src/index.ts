@@ -1,4 +1,5 @@
-import type { Request as PartyRequest, Room, Server } from "partykit/server";
+import type { RpcRequest } from "./types";
+import type { Request as PartyRequest, Room, Server, Connection } from "partykit/server";
 
 export default class IndexServer implements Server {
   room: Room;
@@ -47,6 +48,49 @@ export default class IndexServer implements Server {
     this.loadTimeMs = Date.now() - t0;
   }
 
+  async onMessage(message: string | ArrayBuffer, sender: Connection): Promise<void> {
+    if (typeof message !== "string") return;
+    let req: RpcRequest;
+    try {
+      req = JSON.parse(message) as RpcRequest;
+    } catch {
+      return;
+    }
+    let status = 200;
+    let body = "";
+    try {
+      const result = await this.routeRpc(req);
+      status = result.status;
+      body = result.body;
+    } catch (e) {
+      status = 500;
+      body = JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
+    }
+    sender.send(JSON.stringify({ id: req.id, status, body }));
+  }
+
+  private async routeRpc(req: RpcRequest): Promise<{ status: number; body: string }> {
+    if (req.route === "warm") {
+      return { status: 200, body: "OK" };
+    }
+    if (req.route !== "lookup") {
+      return { status: 404, body: JSON.stringify({ error: "Not found" }) };
+    }
+    if (!this.lookup) {
+      return { status: 503, body: JSON.stringify({ error: "Index not loaded" }) };
+    }
+    const idStr = req.params.id;
+    if (!idStr) {
+      return { status: 400, body: JSON.stringify({ error: "id required" }) };
+    }
+    const id = parseInt(idStr, 10);
+    if (isNaN(id) || id < 0 || id >= this.lookup.length) {
+      return { status: 400, body: JSON.stringify({ error: "id out of range" }) };
+    }
+    const chunk = this.lookup[id];
+    return { status: 200, body: JSON.stringify({ chunk }) };
+  }
+
   async onRequest(req: PartyRequest): Promise<Response> {
     const url = new URL(req.url);
     const path = url.pathname;
@@ -69,28 +113,13 @@ export default class IndexServer implements Server {
     }
 
     if (route === "lookup") {
-      if (!this.lookup) {
-        return new Response(JSON.stringify({ error: "Index not loaded" }), {
-          status: 503,
-          headers: { "Content-Type": "application/json" },
-        });
+      const params: Record<string, string> = {};
+      for (const [k, v] of url.searchParams.entries()) {
+        params[k] = v;
       }
-      const idStr = url.searchParams.get("id");
-      if (!idStr) {
-        return new Response(JSON.stringify({ error: "id required" }), {
-          status: 400,
-          headers: { "Content-Type": "application/json" },
-        });
-      }
-      const id = parseInt(idStr, 10);
-      if (isNaN(id) || id < 0 || id >= this.lookup.length) {
-        return new Response(JSON.stringify({ error: "id out of range" }), {
-          status: 400,
-          headers: { "Content-Type": "application/json" },
-        });
-      }
-      const chunk = this.lookup[id];
-      return new Response(JSON.stringify({ chunk }), {
+      const result = await this.routeRpc({ id: 0, route: "lookup", params });
+      return new Response(result.body, {
+        status: result.status,
         headers: { "Content-Type": "application/json" },
       });
     }

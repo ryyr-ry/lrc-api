@@ -37,6 +37,75 @@ export function hashPartition(artistName: string, trackName: string, numChunks: 
 export const DEFAULT_SEARCH_LIMIT = 20;
 export const MAX_SEARCH_LIMIT = 100;
 
+export interface RpcRequest {
+  id: number;
+  route: string;
+  params: Record<string, string>;
+}
+
+export interface RpcResponse {
+  id: number;
+  status: number;
+  body: string;
+}
+
+export type PartyStub = {
+  get(id: string): {
+    socket(path?: string): Promise<WebSocket>;
+    fetch(pathOrInit?: string | RequestInit): Promise<Response>;
+  };
+};
+
+let rpcSeq = 0;
+
+export async function warmRoom(
+  stub: ReturnType<PartyStub["get"]>
+): Promise<void> {
+  const ws = await stub.socket("/rpc");
+  ws.send(JSON.stringify({ id: ++rpcSeq, route: "warm", params: {} } satisfies RpcRequest));
+  await new Promise<void>((resolve) => {
+    const done = () => resolve();
+    ws.addEventListener("message", done);
+    setTimeout(done, 500);
+  });
+  try {
+    ws.close();
+  } catch {}
+}
+
+export async function rpcCall(
+  stub: ReturnType<PartyStub["get"]>,
+  route: string,
+  params: Record<string, string>,
+  timeoutMs = 30000
+): Promise<RpcResponse> {
+  const ws = await stub.socket("/rpc");
+  const id = ++rpcSeq;
+  return new Promise<RpcResponse>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      try {
+        ws.close();
+      } catch {}
+      reject(new Error(`rpc timeout: ${route}`));
+    }, timeoutMs);
+    ws.addEventListener("message", (event) => {
+      try {
+        const res = JSON.parse(String(event.data)) as RpcResponse;
+        if (res.id === id) {
+          clearTimeout(timer);
+          try {
+            ws.close();
+          } catch {}
+          resolve(res);
+        }
+      } catch {
+        // ignore malformed messages
+      }
+    });
+    ws.send(JSON.stringify({ id, route, params } satisfies RpcRequest));
+  });
+}
+
 export function toApiResponse(rec: LyricRecord): Omit<LyricRecord, "nameLower" | "artistNameLower" | "albumNameLower"> {
   return {
     id: rec.id,

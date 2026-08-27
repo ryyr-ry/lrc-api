@@ -1,4 +1,4 @@
-import { hashPartition, MAX_SEARCH_LIMIT } from "./types";
+import { hashPartition, MAX_SEARCH_LIMIT, rpcCall, warmRoom } from "./types";
 import { TOTAL_ROOMS, NUM_SUPERS, NUM_AGGREGATORS } from "./config";
 import type { Request as PartyRequest, FetchLobby, Cron, CronLobby, PartyKitServer } from "partykit/server";
 import type { ExecutionContext as CFExecutionContext } from "@cloudflare/workers-types";
@@ -44,17 +44,21 @@ async function handleApiGet(
   const chunkRoomId = `chunk-${chunkIndex}`;
   const chunkStub = lobby.parties.chunk.get(chunkRoomId);
 
-  const params = new URLSearchParams();
-  params.set("track_name", trackName);
-  params.set("artist_name", artistName);
-  if (albumName) params.set("album_name", albumName);
-  if (duration !== null) params.set("duration", String(duration));
+  const params: Record<string, string> = {
+    track_name: trackName,
+    artist_name: artistName,
+  };
+  if (albumName) params.album_name = albumName;
+  if (duration !== null) params.duration = String(duration);
 
-  const res = await chunkStub.fetch(`/get?${params.toString()}`);
-  if (res.status === 404) {
+  const rpcRes = await rpcCall(chunkStub, "get", params);
+  if (rpcRes.status === 404) {
     return errorResponse(404, "TrackNotFound", "Failed to find specified track");
   }
-  return res;
+  return new Response(rpcRes.body, {
+    status: rpcRes.status,
+    headers: { "Content-Type": "application/json" },
+  });
 }
 
 async function handleApiGetById(
@@ -72,17 +76,21 @@ async function handleApiGetById(
   }
 
   const indexStub = lobby.parties.index.get("index-0");
-  const indexRes = await indexStub.fetch(`/lookup?id=${id}`);
-  if (!indexRes.ok) {
+  const indexRpc = await rpcCall(indexStub, "lookup", { id: String(id) });
+  if (indexRpc.status !== 200) {
     return errorResponse(404, "TrackNotFound", "Failed to find specified track");
   }
-  const indexData = await indexRes.json() as { chunk: number };
+  const indexData = JSON.parse(indexRpc.body) as { chunk: number };
   const chunkIdx = indexData.chunk;
   if (typeof chunkIdx !== "number" || isNaN(chunkIdx) || chunkIdx < 0) {
     return errorResponse(404, "TrackNotFound", "Failed to find specified track");
   }
   const chunkStub = lobby.parties.chunk.get(`chunk-${chunkIdx}`);
-  return chunkStub.fetch(`/get-by-id?id=${id}`);
+  const chunkRpc = await rpcCall(chunkStub, "get-by-id", { id: String(id) });
+  return new Response(chunkRpc.body, {
+    status: chunkRpc.status,
+    headers: { "Content-Type": "application/json" },
+  });
 }
 
 async function handleApiSearch(
@@ -106,14 +114,17 @@ async function handleApiSearch(
   const superId = getSuperId(query);
   const superStub = lobby.parties.aggregator.get(superId);
 
-  const params = new URLSearchParams();
-  if (q) params.set("q", q);
-  if (trackName) params.set("track_name", trackName);
-  if (artistName) params.set("artist_name", artistName);
-  if (albumName) params.set("album_name", albumName);
-  params.set("limit", String(limit));
+  const params: Record<string, string> = { limit: String(limit) };
+  if (q) params.q = q;
+  if (trackName) params.track_name = trackName;
+  if (artistName) params.artist_name = artistName;
+  if (albumName) params.album_name = albumName;
 
-  return superStub.fetch(`/search?${params.toString()}`);
+  const rpcRes = await rpcCall(superStub, "search", params, 60000);
+  return new Response(rpcRes.body, {
+    status: rpcRes.status,
+    headers: { "Content-Type": "application/json" },
+  });
 }
 
 async function handleApiSearchLyrics(
@@ -131,7 +142,11 @@ async function handleApiSearchLyrics(
 
   const superId = getSuperId(q);
   const superStub = lobby.parties.aggregator.get(superId);
-  return superStub.fetch(`/search-lyrics?q=${encodeURIComponent(q)}&limit=${limit}`);
+  const rpcRes = await rpcCall(superStub, "search-lyrics", { q, limit: String(limit) }, 60000);
+  return new Response(rpcRes.body, {
+    status: rpcRes.status,
+    headers: { "Content-Type": "application/json" },
+  });
 }
 
 function handlePostEndpoint(): Response {
@@ -215,9 +230,9 @@ export default {
 
     const chunkParty = lobby.parties.chunk;
     for (let i = 0; i < CONFIG.totalRooms; i += batchSize) {
-      const batch: Promise<Response>[] = [];
+      const batch: Promise<void>[] = [];
       for (let j = i; j < Math.min(i + batchSize, CONFIG.totalRooms); j++) {
-        batch.push(chunkParty.get(`chunk-${j}`).fetch("/warm"));
+        batch.push(warmRoom(chunkParty.get(`chunk-${j}`)));
       }
       await Promise.all(batch);
     }
@@ -225,18 +240,18 @@ export default {
     const aggParty = lobby.parties.aggregator;
     const totalAgg = NUM_SUPERS + NUM_AGGREGATORS;
     for (let i = 0; i < totalAgg; i += batchSize) {
-      const batch: Promise<Response>[] = [];
+      const batch: Promise<void>[] = [];
       for (let j = i; j < Math.min(i + batchSize, totalAgg); j++) {
         if (j < NUM_SUPERS) {
-          batch.push(aggParty.get(`super-${j}`).fetch("/warm"));
+          batch.push(warmRoom(aggParty.get(`super-${j}`)));
         } else {
-          batch.push(aggParty.get(`agg-${j - NUM_SUPERS}`).fetch("/warm"));
+          batch.push(warmRoom(aggParty.get(`agg-${j - NUM_SUPERS}`)));
         }
       }
       await Promise.all(batch);
     }
 
     const indexParty = lobby.parties.index;
-    await indexParty.get("index-0").fetch("/warm");
+    await warmRoom(indexParty.get("index-0"));
   },
 } satisfies PartyKitServer;

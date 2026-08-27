@@ -1,6 +1,6 @@
-import type { LyricRecord } from "./types";
+import type { LyricRecord, RpcRequest } from "./types";
 import { prepareInput, toApiResponse, DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT } from "./types";
-import type { Request as PartyRequest, Room, Server } from "partykit/server";
+import type { Request as PartyRequest, Room, Server, Connection } from "partykit/server";
 
 export default class ChunkServer implements Server {
   room: Room;
@@ -87,6 +87,41 @@ export default class ChunkServer implements Server {
       status: 404,
       headers: { "Content-Type": "application/json" },
     });
+  }
+
+  async onMessage(message: string | ArrayBuffer, sender: Connection): Promise<void> {
+    if (typeof message !== "string") return;
+    let req: RpcRequest;
+    try {
+      req = JSON.parse(message) as RpcRequest;
+    } catch {
+      return;
+    }
+    const url = new URL(`http://rpc.local/${req.route}`);
+    for (const [k, v] of Object.entries(req.params)) {
+      url.searchParams.set(k, v);
+    }
+    let res: Response;
+    try {
+      res = await this.routeRpc(url);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      res = new Response(JSON.stringify({ error: msg }), { status: 500 });
+    }
+    sender.send(
+      JSON.stringify({ id: req.id, status: res.status, body: await res.text() })
+    );
+  }
+
+  private async routeRpc(url: URL): Promise<Response> {
+    const segments = url.pathname.split("/");
+    const route = segments[segments.length - 1];
+    if (route === "warm") return new Response("OK", { status: 200 });
+    if (route === "get") return this.handleGet(url);
+    if (route === "get-by-id") return this.handleGetById(url);
+    if (route === "search") return this.handleSearch(url);
+    if (route === "search-lyrics") return this.handleSearchLyrics(url);
+    return new Response(JSON.stringify({ error: "Not found" }), { status: 404 });
   }
 
   private async handleGet(url: URL): Promise<Response> {
