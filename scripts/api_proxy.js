@@ -27,8 +27,24 @@ const HOP_BY_HOP = new Set([
   "upgrade",
 ]);
 
+let logQueue = [];
+let logFlushing = false;
+
 function log(line) {
-  fs.appendFileSync(LOGFILE, line + "\n");
+  logQueue.push(line + "\n");
+  if (!logFlushing) {
+    logFlushing = true;
+    setImmediate(() => {
+      logFlushing = false;
+      const batch = logQueue.join("");
+      logQueue = [];
+      fs.appendFile(LOGFILE, batch, (err) => {
+        if (err) {
+          process.stderr.write(`log error: ${err.message}\n`);
+        }
+      });
+    });
+  }
 }
 
 function stripHopByHop(headers) {
@@ -377,16 +393,13 @@ const server = http.createServer((req, res) => {
   const isManifest = isManifestEndpoint(req.method, req.url);
 
   if (req.method === "PUT" && req.url.includes("/assets")) {
-    const authPresent = req.headers.authorization ? "yes" : "no";
-    log(`>>> ${req.method} ${req.url} auth=${authPresent} (streaming, early 200)`);
     const transferPromise = forwardStreaming(req.method, req.url, req.headers, req, res).then((result) => {
       if (result.alreadySent) {
-        log(`<<< ${req.method} ${req.url} early 200 sent, background transfer continues`);
         return;
       }
       const preview = result.body.toString("utf8").slice(0, 200);
       log(
-        `<<< ${req.method} ${req.url} status=${result.status} body=${result.body.length} bytes: ${preview}`
+        `<<< PUT ${req.url} status=${result.status} body=${result.body.length} bytes: ${preview}`
       );
       res.writeHead(result.status, result.headers);
       res.end(result.body);
