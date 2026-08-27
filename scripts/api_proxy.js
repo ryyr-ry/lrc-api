@@ -173,7 +173,7 @@ function forwardStreaming(method, url, headers, bodyStream, clientRes) {
         });
         upstreamRes.on("end", () => {
           if (clientRes && earlyResponded) {
-            const preview = resBody.toString("utf8").slice(0, 160);
+            const preview = safePreview(resBody, 160);
             log(
               `!!! PUT background result ${method} ${url}: status=${upstreamRes.statusCode} body=${preview}`
             );
@@ -389,15 +389,27 @@ async function splitManifest(method, url, headers, body) {
   };
 }
 
+function safePreview(buf, maxLen) {
+  const slice = buf.subarray(0, maxLen);
+  if (slice.includes(0)) {
+    return `<binary ${buf.length} bytes>`;
+  }
+  return slice.toString("utf8");
+}
+
 const server = http.createServer((req, res) => {
   const isManifest = isManifestEndpoint(req.method, req.url);
+
+  if (req.headers.expect && req.headers.expect.toLowerCase() === "100-continue") {
+    res.writeContinue();
+  }
 
   if (req.method === "PUT" && req.url.includes("/assets")) {
     const transferPromise = forwardStreaming(req.method, req.url, req.headers, req, res).then((result) => {
       if (result.alreadySent) {
         return;
       }
-      const preview = result.body.toString("utf8").slice(0, 200);
+      const preview = safePreview(result.body, 200);
       log(
         `<<< PUT ${req.url} status=${result.status} body=${result.body.length} bytes: ${preview}`
       );
@@ -417,27 +429,52 @@ const server = http.createServer((req, res) => {
     res.writeHead(400);
     res.end();
   });
+  let pendingManifestTransfers = [];
+
+async function waitForPendingManifests() {
+  if (pendingManifestTransfers.length === 0) return;
+  log(`!!! waiting for ${pendingManifestTransfers.length} background manifest transfers`);
+  await Promise.all(pendingManifestTransfers);
+  pendingManifestTransfers = [];
+  log(`!!! background manifest transfers complete`);
+}
+
   req.on("end", async () => {
     const authPresent = req.headers.authorization ? "yes" : "no";
     log(`>>> ${req.method} ${req.url} body=${body.length} auth=${authPresent}`);
 
-    if (isManifest && body.length > 0) {
+    const isFinalDeploy =
+      req.method === "POST" && /\/parties\/[^/]+\/[^/]+$/.test(req.url);
+    if (isFinalDeploy) {
       await waitForPendingPuts();
+      await waitForPendingManifests();
     }
 
-    let result;
     if (isManifest && body.length > 0) {
-      try {
-        result = await splitManifest(req.method, req.url, req.headers, body);
-      } catch (err) {
-        log(`!!! manifest split parse error: ${err.message}`);
-        result = await forwardWithRetry(req.method, req.url, req.headers, body);
-      }
-    } else {
-      result = await forward(req.method, req.url, req.headers, body);
+      const transferPromise = (async () => {
+        await waitForPendingPuts();
+        try {
+          return await splitManifest(req.method, req.url, req.headers, body);
+        } catch (err) {
+          log(`!!! manifest split parse error: ${err.message}`);
+          return await forwardWithRetry(req.method, req.url, req.headers, body);
+        }
+      })();
+      pendingManifestTransfers.push(transferPromise);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end('{"success":true}');
+      log(`<<< ${req.method} ${req.url} early 200 sent, manifest transfer in background`);
+      transferPromise.then((result) => {
+        const preview = safePreview(result.body, 200);
+        log(
+          `!!! manifest background result ${req.method} ${req.url}: status=${result.status} body=${preview}`
+        );
+      });
+      return;
     }
 
-    const preview = result.body.toString("utf8").slice(0, 200);
+    const result = await forward(req.method, req.url, req.headers, body);
+    const preview = safePreview(result.body, 200);
     log(
       `<<< ${req.method} ${req.url} status=${result.status} body=${result.body.length} bytes: ${preview}`
     );
