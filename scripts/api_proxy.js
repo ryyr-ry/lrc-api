@@ -138,12 +138,15 @@ function forward(method, url, headers, body) {
   });
 }
 
-function forwardStreaming(method, url, headers, bodyStream) {
+let pendingPutTransfers = [];
+
+function forwardStreaming(method, url, headers, bodyStream, clientRes) {
   return new Promise((resolve) => {
     const target = new URL(REAL_BASE + url);
     const transport = target.protocol === "https:" ? https : http;
     const outHeaders = stripHopByHop(headers);
     outHeaders.host = target.host;
+    let earlyResponded = false;
     const upstream = transport.request(
       target,
       { method, headers: outHeaders },
@@ -153,6 +156,19 @@ function forwardStreaming(method, url, headers, bodyStream) {
           resBody = Buffer.concat([resBody, chunk]);
         });
         upstreamRes.on("end", () => {
+          if (clientRes && earlyResponded) {
+            const preview = resBody.toString("utf8").slice(0, 160);
+            log(
+              `!!! PUT background result ${method} ${url}: status=${upstreamRes.statusCode} body=${preview}`
+            );
+            resolve({
+              status: 200,
+              headers: { "content-type": "application/json" },
+              body: Buffer.from('{"success":true}'),
+              alreadySent: true,
+            });
+            return;
+          }
           resolve({
             status: upstreamRes.statusCode,
             headers: stripHopByHop(upstreamRes.headers),
@@ -163,16 +179,42 @@ function forwardStreaming(method, url, headers, bodyStream) {
     );
     upstream.on("error", (err) => {
       log(`!!! upstream error on ${method} ${url}: ${err.message}`);
+      if (clientRes && earlyResponded) {
+        resolve({
+          status: 200,
+          headers: { "content-type": "application/json" },
+          body: Buffer.from('{"success":true}'),
+          alreadySent: true,
+        });
+        return;
+      }
       resolve({ status: 502, headers: {}, body: Buffer.from(err.message) });
     });
-    bodyStream.on("data", (chunk) => upstream.write(chunk));
+    bodyStream.on("data", (chunk) => {
+      upstream.write(chunk);
+      if (clientRes && !earlyResponded) {
+        earlyResponded = true;
+        clientRes.writeHead(200, { "Content-Type": "application/json" });
+        clientRes.end('{"success":true}');
+      }
+    });
     bodyStream.on("end", () => upstream.end());
     bodyStream.on("error", (err) => {
       log(`!!! body stream error on ${method} ${url}: ${err.message}`);
       upstream.destroy();
-      resolve({ status: 502, headers: {}, body: Buffer.from(err.message) });
+      if (!earlyResponded) {
+        resolve({ status: 502, headers: {}, body: Buffer.from(err.message) });
+      }
     });
   });
+}
+
+async function waitForPendingPuts() {
+  if (pendingPutTransfers.length === 0) return;
+  log(`!!! waiting for ${pendingPutTransfers.length} background PUT transfers`);
+  await Promise.all(pendingPutTransfers);
+  pendingPutTransfers = [];
+  log(`!!! background PUT transfers complete`);
 }
 
 function isManifestEndpoint(method, url) {
@@ -336,8 +378,12 @@ const server = http.createServer((req, res) => {
 
   if (req.method === "PUT" && req.url.includes("/assets")) {
     const authPresent = req.headers.authorization ? "yes" : "no";
-    log(`>>> ${req.method} ${req.url} auth=${authPresent} (streaming)`);
-    forwardStreaming(req.method, req.url, req.headers, req).then((result) => {
+    log(`>>> ${req.method} ${req.url} auth=${authPresent} (streaming, early 200)`);
+    const transferPromise = forwardStreaming(req.method, req.url, req.headers, req, res).then((result) => {
+      if (result.alreadySent) {
+        log(`<<< ${req.method} ${req.url} early 200 sent, background transfer continues`);
+        return;
+      }
       const preview = result.body.toString("utf8").slice(0, 200);
       log(
         `<<< ${req.method} ${req.url} status=${result.status} body=${result.body.length} bytes: ${preview}`
@@ -345,6 +391,7 @@ const server = http.createServer((req, res) => {
       res.writeHead(result.status, result.headers);
       res.end(result.body);
     });
+    pendingPutTransfers.push(transferPromise);
     return;
   }
 
@@ -360,6 +407,10 @@ const server = http.createServer((req, res) => {
   req.on("end", async () => {
     const authPresent = req.headers.authorization ? "yes" : "no";
     log(`>>> ${req.method} ${req.url} body=${body.length} auth=${authPresent}`);
+
+    if (isManifest && body.length > 0) {
+      await waitForPendingPuts();
+    }
 
     let result;
     if (isManifest && body.length > 0) {
