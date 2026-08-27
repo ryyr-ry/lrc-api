@@ -112,7 +112,14 @@ async function apiRequest(method, urlPath, headers, body) {
     let authHeaders = headers || {};
     try {
       const token = await getSessionToken();
-      authHeaders = { ...authHeaders, Authorization: `Bearer ${token}` };
+      authHeaders = {
+        Accept: "application/json",
+        "User-Agent": "partykit/0.0.115",
+        "X-PartyKit-Version": "0.0.115",
+        "X-PartyKit-User-Type": "clerk",
+        ...authHeaders,
+        Authorization: `Bearer ${token}`,
+      };
     } catch (e) {
       log(`token refresh failed: ${e.message}`);
     }
@@ -122,8 +129,9 @@ async function apiRequest(method, urlPath, headers, body) {
       log(`request error ${method} ${urlPath}: ${err.message}`);
       lastRes = { status: 0, body: Buffer.from(err.message) };
     }
-    if (lastRes.status === 401 && attempt === 0) {
+    if (lastRes.status === 401) {
       sessionToken = null;
+      log(`401 on ${method} ${urlPath}, refreshing token and retrying (attempt ${attempt + 1}/5)`);
       continue;
     }
     if (lastRes.status === 429 || lastRes.status >= 500 || lastRes.status === 0) {
