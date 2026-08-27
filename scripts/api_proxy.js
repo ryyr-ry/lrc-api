@@ -155,73 +155,40 @@ function forward(method, url, headers, body) {
 }
 
 let pendingPutTransfers = [];
+let putQueue = [];
+let putQueueRunning = 0;
+const PUT_CONCURRENCY = parseInt(process.env.PROXY_PUT_CONCURRENCY || "8", 10);
 
-function forwardStreaming(method, url, headers, bodyStream, clientRes) {
+async function pumpPutQueue() {
+  while (putQueueRunning < PUT_CONCURRENCY && putQueue.length > 0) {
+    const job = putQueue.shift();
+    putQueueRunning += 1;
+    job()
+      .catch((err) => {
+        log(`!!! put queue job error: ${err.message}`);
+      })
+      .finally(() => {
+        putQueueRunning -= 1;
+        pumpPutQueue();
+      });
+  }
+}
+
+function enqueuePut(method, url, headers, body) {
   return new Promise((resolve) => {
-    const target = new URL(REAL_BASE + url);
-    const transport = target.protocol === "https:" ? https : http;
-    const outHeaders = stripHopByHop(headers);
-    outHeaders.host = target.host;
-    let earlyResponded = false;
-    const upstream = transport.request(
-      target,
-      { method, headers: outHeaders },
-      (upstreamRes) => {
-        let resBody = Buffer.alloc(0);
-        upstreamRes.on("data", (chunk) => {
-          resBody = Buffer.concat([resBody, chunk]);
-        });
-        upstreamRes.on("end", () => {
-          if (clientRes && earlyResponded) {
-            const preview = safePreview(resBody, 160);
-            log(
-              `!!! PUT background result ${method} ${url}: status=${upstreamRes.statusCode} body=${preview}`
-            );
-            resolve({
-              status: 200,
-              headers: { "content-type": "application/json" },
-              body: Buffer.from('{"success":true}'),
-              alreadySent: true,
-            });
-            return;
-          }
-          resolve({
-            status: upstreamRes.statusCode,
-            headers: stripHopByHop(upstreamRes.headers),
-            body: resBody,
-          });
-        });
+    const job = async () => {
+      const res = await forwardWithRetry(method, url, headers, body);
+      if (res.status >= 400) {
+        log(
+          `!!! PUT failed after retries ${url}: status=${res.status} body=${safePreview(res.body, 160)}`
+        );
+      } else {
+        log(`!!! PUT background ok ${url}: status=${res.status}`);
       }
-    );
-    upstream.on("error", (err) => {
-      log(`!!! upstream error on ${method} ${url}: ${err.message}`);
-      if (clientRes && earlyResponded) {
-        resolve({
-          status: 200,
-          headers: { "content-type": "application/json" },
-          body: Buffer.from('{"success":true}'),
-          alreadySent: true,
-        });
-        return;
-      }
-      resolve({ status: 502, headers: {}, body: Buffer.from(err.message) });
-    });
-    bodyStream.on("data", (chunk) => {
-      upstream.write(chunk);
-      if (clientRes && !earlyResponded) {
-        earlyResponded = true;
-        clientRes.writeHead(200, { "Content-Type": "application/json" });
-        clientRes.end('{"success":true}');
-      }
-    });
-    bodyStream.on("end", () => upstream.end());
-    bodyStream.on("error", (err) => {
-      log(`!!! body stream error on ${method} ${url}: ${err.message}`);
-      upstream.destroy();
-      if (!earlyResponded) {
-        resolve({ status: 502, headers: {}, body: Buffer.from(err.message) });
-      }
-    });
+      resolve(res);
+    };
+    putQueue.push(job);
+    pumpPutQueue();
   });
 }
 
@@ -397,6 +364,16 @@ function safePreview(buf, maxLen) {
   return slice.toString("utf8");
 }
 
+let pendingManifestTransfers = [];
+
+async function waitForPendingManifests() {
+  if (pendingManifestTransfers.length === 0) return;
+  log(`!!! waiting for ${pendingManifestTransfers.length} background manifest transfers`);
+  await Promise.all(pendingManifestTransfers);
+  pendingManifestTransfers = [];
+  log(`!!! background manifest transfers complete`);
+}
+
 const server = http.createServer((req, res) => {
   const isManifest = isManifestEndpoint(req.method, req.url);
 
@@ -405,18 +382,26 @@ const server = http.createServer((req, res) => {
   }
 
   if (req.method === "PUT" && req.url.includes("/assets")) {
-    const transferPromise = forwardStreaming(req.method, req.url, req.headers, req, res).then((result) => {
-      if (result.alreadySent) {
-        return;
-      }
-      const preview = safePreview(result.body, 200);
-      log(
-        `<<< PUT ${req.url} status=${result.status} body=${result.body.length} bytes: ${preview}`
-      );
-      res.writeHead(result.status, result.headers);
-      res.end(result.body);
+    let putBody = Buffer.alloc(0);
+    req.on("data", (chunk) => {
+      putBody = Buffer.concat([putBody, chunk]);
     });
-    pendingPutTransfers.push(transferPromise);
+    req.on("error", (err) => {
+      log(`!!! client error on PUT ${req.url}: ${err.message}`);
+      res.writeHead(400);
+      res.end();
+    });
+    req.on("end", () => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end('{"success":true}');
+      const transferPromise = enqueuePut(
+        req.method,
+        req.url,
+        req.headers,
+        putBody
+      );
+      pendingPutTransfers.push(transferPromise);
+    });
     return;
   }
 
@@ -429,15 +414,6 @@ const server = http.createServer((req, res) => {
     res.writeHead(400);
     res.end();
   });
-  let pendingManifestTransfers = [];
-
-async function waitForPendingManifests() {
-  if (pendingManifestTransfers.length === 0) return;
-  log(`!!! waiting for ${pendingManifestTransfers.length} background manifest transfers`);
-  await Promise.all(pendingManifestTransfers);
-  pendingManifestTransfers = [];
-  log(`!!! background manifest transfers complete`);
-}
 
   req.on("end", async () => {
     const authPresent = req.headers.authorization ? "yes" : "no";
