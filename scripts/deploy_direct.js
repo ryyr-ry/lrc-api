@@ -17,7 +17,7 @@ const CLIENT_TOKEN = process.env.PARTYKIT_TOKEN || "";
 const LOGIN = process.env.PARTYKIT_LOGIN || "";
 const BATCH_MAX_FILES = 500;
 const BATCH_MAX_BYTES = 95 * 1024 * 1024;
-const PUT_CONCURRENCY = 8;
+const PUT_CONCURRENCY = parseInt(process.env.PUT_CONCURRENCY || "2", 10);
 const MANIFEST_CONCURRENCY = 4;
 
 const configPath = path.resolve("partykit.json");
@@ -482,18 +482,21 @@ async function main() {
   }
 
   log("posting asset index (split)...");
-  const indexRes = await postManifestBatches(
-    `/parties/${LOGIN}/${projectName}/assets`,
-    manifest
-  );
-  if (indexRes.status >= 400) {
-    log(`asset index failed: ${indexRes.status} ${indexRes.body.toString("utf8")}`);
-    process.exit(1);
+  if (process.env.SKIP_POST_ASSETS !== "1") {
+    const indexRes = await postManifestBatches(
+      `/parties/${LOGIN}/${projectName}/assets`,
+      manifest
+    );
+    if (indexRes.status >= 400) {
+      log(`asset index failed: ${indexRes.status} ${indexRes.body.toString("utf8")}`);
+      process.exit(1);
+    }
+  } else {
+    log("SKIP_POST_ASSETS=1: skipping POST /assets, relying on final deploy manifest");
   }
 
   log("final deploy POST...");
-  const slimManifest = buildAssetManifest(false);
-  const form = buildFinalForm(code, slimManifest);
+  const form = buildFinalForm(code, manifest);
   const deployRes = await finalDeployRequest(form);
   log(`deploy response: ${deployRes.status} ${deployRes.body.toString("utf8").slice(0, 300)}`);
   if (deployRes.status >= 400) {
