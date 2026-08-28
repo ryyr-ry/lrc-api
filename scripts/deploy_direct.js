@@ -17,7 +17,7 @@ const CLIENT_TOKEN = process.env.PARTYKIT_TOKEN || "";
 const LOGIN = process.env.PARTYKIT_LOGIN || "";
 const BATCH_MAX_FILES = 500;
 const BATCH_MAX_BYTES = 95 * 1024 * 1024;
-const PUT_CONCURRENCY = parseInt(process.env.PUT_CONCURRENCY || "2", 10);
+const PUT_CONCURRENCY = parseInt(process.env.PUT_CONCURRENCY || "4", 10);
 const MANIFEST_CONCURRENCY = 4;
 
 const configPath = path.resolve("partykit.json");
