@@ -165,7 +165,7 @@ function findAllFiles(root) {
   return results;
 }
 
-function buildAssetManifest() {
+function buildAssetManifest(includeAssetInfo = true) {
   const manifest = { devServer: "", assets: {}, assetInfo: {} };
   for (const filePath of findAllFiles(assetsPath)) {
     const rel = path.relative(assetsPath, filePath).replace(/\\/g, "/");
@@ -178,11 +178,13 @@ function buildAssetManifest() {
     const ext = path.extname(rel);
     const fileName = `${base}-${fileHash}${ext}`;
     manifest.assets[rel] = fileName;
-    manifest.assetInfo[rel] = {
-      fileHash,
-      fileSize,
-      fileName: `${base}${ext}`,
-    };
+    if (includeAssetInfo) {
+      manifest.assetInfo[rel] = {
+        fileHash,
+        fileSize,
+        fileName: `${base}${ext}`,
+      };
+    }
   }
   return manifest;
 }
@@ -490,7 +492,8 @@ async function main() {
   }
 
   log("final deploy POST...");
-  const form = buildFinalForm(code, manifest);
+  const slimManifest = buildAssetManifest(false);
+  const form = buildFinalForm(code, slimManifest);
   const deployRes = await finalDeployRequest(form);
   log(`deploy response: ${deployRes.status} ${deployRes.body.toString("utf8").slice(0, 300)}`);
   if (deployRes.status >= 400) {
