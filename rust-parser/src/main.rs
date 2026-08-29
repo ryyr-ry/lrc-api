@@ -22,7 +22,7 @@ fn ring_pages() -> usize {
 
 const INDEX_PART_U16S: usize = (16 * 1024 * 1024) / 2;
 const LYRICS_TEMP_PREFIX: &str = "/tmp/lyrics_temp";
-const LYRICS_CHUNK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const LYRICS_CHUNK_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Lyrics spill: independent zstd frames across 2GB chunk files.
 /// Each lyric record becomes an independent frame via a reused bulk
