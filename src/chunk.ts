@@ -1,92 +1,170 @@
 import type { LyricRecord, RpcRequest } from "./types";
-import { prepareInput, toApiResponse, DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT } from "./types";
+import {
+  prepareInput,
+  toApiResponse,
+  DEFAULT_SEARCH_LIMIT,
+  MAX_SEARCH_LIMIT,
+  roomFileUrl,
+  fetchRoomFile,
+} from "./types";
+import { RELEASE_TAGS, LOAD_MAX_ATTEMPTS, LOAD_RETRY_BASE_DELAY_MS } from "./config";
 import type { Request as PartyRequest, Room, Server, Connection } from "partykit/server";
+
+export type RoomState = "unloaded" | "loading" | "ready";
+
+export interface RoomFilePayload {
+  room_id: number;
+  dump_key: string;
+  expected_count: number;
+  records: LyricRecord[];
+}
+
+function jsonResponse(data: unknown, status = 200): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
 
 export default class ChunkServer implements Server {
   room: Room;
+  state: RoomState = "unloaded";
   records: LyricRecord[] = [];
-  loaded = false;
   loadTimeMs = 0;
-  chunkIndex = -1;
+  lastError = "";
+  roomId = -1;
+  generation = -1;
+  loadAttempts = 0;
 
   private lruCache = new Map<string, string>();
   private readonly LRU_MAX_BYTES = 20 * 1024 * 1024;
   private lruCacheBytes = 0;
-
   private inflight = new Map<string, Promise<string>>();
+  private loadPromise: Promise<boolean> | null = null;
 
   constructor(room: Room) {
     this.room = room;
+    const match = room.id.match(/^chunk-(\d+)-(\d+)$/);
+    if (match) {
+      this.generation = parseInt(match[1], 10);
+      this.roomId = parseInt(match[2], 10);
+    } else {
+      this.lastError = `invalid room id: ${room.id}`;
+    }
   }
 
   async onStart() {
-    this.chunkIndex = parseInt(this.room.id.replace("chunk-", ""), 10);
-    if (isNaN(this.chunkIndex)) {
-      console.error(`Invalid chunk index from room id: ${this.room.id}`);
-      return;
-    }
+    await this.ensureLoaded();
+  }
 
+  private async ensureLoaded(): Promise<boolean> {
+    if (this.state === "ready") return true;
+    if (this.loadPromise) return this.loadPromise;
+    this.loadPromise = this.tryLoad();
+    try {
+      return await this.loadPromise;
+    } finally {
+      this.loadPromise = null;
+    }
+  }
+
+  private async tryLoad(): Promise<boolean> {
+    if (this.roomId < 0 || this.generation < 0) {
+      this.lastError = "invalid room id";
+      this.state = "unloaded";
+      return false;
+    }
+    this.state = "loading";
     const t0 = Date.now();
-    for (let part = 0; ; part++) {
-      const path = `/data/chunk-${this.chunkIndex}-${part}.json`;
+
+    for (let attempt = 0; attempt < LOAD_MAX_ATTEMPTS; attempt++) {
       try {
-        const res = await this.room.context.assets.fetch(path);
-        if (!res || res.status !== 200) break;
+        const fileUrl = roomFileUrl(this.roomId, RELEASE_TAGS);
+        const res = await fetchRoomFile(fileUrl);
+        if (!res.ok) {
+          this.lastError = `fetch ${fileUrl} -> ${res.status}`;
+          throw new Error(this.lastError);
+        }
         const text = await res.text();
-        const partRecords = JSON.parse(text) as LyricRecord[];
-        this.records.push(...partRecords);
+        let payload: RoomFilePayload;
+        try {
+          payload = JSON.parse(text) as RoomFilePayload;
+        } catch {
+          this.lastError = `invalid json from room file (room ${this.roomId})`;
+          throw new Error(this.lastError);
+        }
+        if (!Array.isArray(payload.records)) {
+          this.lastError = "payload.records is not an array";
+          throw new Error(this.lastError);
+        }
+        if (payload.records.length !== payload.expected_count) {
+          this.lastError = `count mismatch: ${payload.records.length} != ${payload.expected_count}`;
+          throw new Error(this.lastError);
+        }
+        this.records = payload.records;
+        this.loadTimeMs = Date.now() - t0;
+        this.loadAttempts = attempt + 1;
+        this.state = "ready";
+        return true;
       } catch (e) {
-        console.error(`Failed to load ${path}: ${e}`);
-        break;
+        this.lastError = e instanceof Error ? e.message : String(e);
       }
+      await new Promise((r) => setTimeout(r, attempt * LOAD_RETRY_BASE_DELAY_MS));
     }
 
-    this.loaded = true;
-    this.loadTimeMs = Date.now() - t0;
+    this.state = "unloaded";
+    this.loadAttempts = LOAD_MAX_ATTEMPTS;
+    return false;
+  }
+
+  private gate(): Response | null {
+    if (this.state === "ready") return null;
+    if (this.state === "unloaded") {
+      void this.ensureLoaded();
+    }
+    return jsonResponse(
+      {
+        code: 503,
+        name: "NotReady",
+        message: `room not ready (${this.state}): ${this.lastError}`,
+      },
+      503
+    );
   }
 
   async onRequest(req: PartyRequest): Promise<Response> {
     const url = new URL(req.url);
-    const path = url.pathname;
-    const segments = path.split("/");
+    const segments = url.pathname.split("/");
     const route = segments[segments.length - 1];
 
     if (route === "warm") {
-      return new Response("OK", { status: 200 });
+      if (this.state !== "ready") {
+        void this.ensureLoaded();
+      }
+      return jsonResponse({ state: this.state });
     }
 
     if (route === "info") {
-      return new Response(
-        JSON.stringify({
-          chunk: this.chunkIndex,
-          loaded: this.loaded,
-          recordCount: this.records.length,
-          loadTimeMs: this.loadTimeMs,
-        }),
-        { headers: { "Content-Type": "application/json" } }
-      );
+      return jsonResponse({
+        chunk: this.roomId,
+        generation: this.generation,
+        state: this.state,
+        recordCount: this.records.length,
+        loadTimeMs: this.loadTimeMs,
+        loadAttempts: this.loadAttempts,
+        lastError: this.lastError,
+      });
     }
 
-    if (route === "get") {
-      return this.handleGet(url);
-    }
+    const g = this.gate();
+    if (g) return g;
 
-    if (route === "get-by-id") {
-      return this.handleGetById(url);
-    }
+    if (route === "get") return this.handleGet(url);
+    if (route === "get-by-id") return this.handleGetById(url);
+    if (route === "search") return this.handleSearch(url);
+    if (route === "search-lyrics") return this.handleSearchLyrics(url);
 
-    if (route === "search") {
-      return this.handleSearch(url);
-    }
-
-    if (route === "search-lyrics") {
-      return this.handleSearchLyrics(url);
-    }
-
-    return new Response(JSON.stringify({ error: "Not found" }), {
-      status: 404,
-      headers: { "Content-Type": "application/json" },
-    });
+    return jsonResponse({ error: "Not found" }, 404);
   }
 
   async onMessage(message: string | ArrayBuffer, sender: Connection): Promise<void> {
@@ -106,7 +184,7 @@ export default class ChunkServer implements Server {
       res = await this.routeRpc(url);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      res = new Response(JSON.stringify({ error: msg }), { status: 500 });
+      res = jsonResponse({ error: msg }, 500);
     }
     sender.send(
       JSON.stringify({ id: req.id, status: res.status, body: await res.text() })
@@ -116,12 +194,25 @@ export default class ChunkServer implements Server {
   private async routeRpc(url: URL): Promise<Response> {
     const segments = url.pathname.split("/");
     const route = segments[segments.length - 1];
-    if (route === "warm") return new Response("OK", { status: 200 });
+    if (route === "warm") {
+      if (this.state !== "ready") {
+        void this.ensureLoaded();
+      }
+      return jsonResponse({ state: this.state });
+    }
+    const g = this.gate();
+    if (g) return g;
     if (route === "get") return this.handleGet(url);
     if (route === "get-by-id") return this.handleGetById(url);
     if (route === "search") return this.handleSearch(url);
     if (route === "search-lyrics") return this.handleSearchLyrics(url);
-    return new Response(JSON.stringify({ error: "Not found" }), { status: 404 });
+    return jsonResponse({ error: "Not found" }, 404);
+  }
+
+  async onAlarm() {
+    if (this.state !== "ready") {
+      await this.ensureLoaded();
+    }
   }
 
   private async handleGet(url: URL): Promise<Response> {
@@ -153,44 +244,34 @@ export default class ChunkServer implements Server {
     }
 
     if (best !== null) {
-      return new Response(JSON.stringify(toApiResponse(best)), {
-        headers: { "Content-Type": "application/json" },
-      });
+      return jsonResponse(toApiResponse(best));
     }
 
-    return new Response(
-      JSON.stringify({ code: 404, name: "TrackNotFound", message: "Failed to find specified track" }),
-      { status: 404, headers: { "Content-Type": "application/json" } }
+    return jsonResponse(
+      { code: 404, name: "TrackNotFound", message: "Failed to find specified track" },
+      404
     );
   }
 
   private async handleGetById(url: URL): Promise<Response> {
     const idStr = url.searchParams.get("id");
     if (!idStr) {
-      return new Response(JSON.stringify({ error: "id required" }), {
-        status: 400,
-        headers: { "Content-Type": "application/json" },
-      });
+      return jsonResponse({ error: "id required" }, 400);
     }
     const id = parseInt(idStr, 10);
     if (isNaN(id) || id < 1) {
-      return new Response(JSON.stringify({ error: "invalid id" }), {
-        status: 400,
-        headers: { "Content-Type": "application/json" },
-      });
+      return jsonResponse({ error: "invalid id" }, 400);
     }
 
     for (const rec of this.records) {
       if (rec.id === id) {
-        return new Response(JSON.stringify(toApiResponse(rec)), {
-          headers: { "Content-Type": "application/json" },
-        });
+        return jsonResponse(toApiResponse(rec));
       }
     }
 
-    return new Response(
-      JSON.stringify({ code: 404, name: "TrackNotFound", message: "Failed to find specified track" }),
-      { status: 404, headers: { "Content-Type": "application/json" } }
+    return jsonResponse(
+      { code: 404, name: "TrackNotFound", message: "Failed to find specified track" },
+      404
     );
   }
 
@@ -267,9 +348,7 @@ export default class ChunkServer implements Server {
     const limit = Math.min(Math.max(parseInt(limitStr || String(DEFAULT_SEARCH_LIMIT), 10) || DEFAULT_SEARCH_LIMIT, 1), MAX_SEARCH_LIMIT);
 
     if (!q) {
-      return new Response(JSON.stringify([]), {
-        headers: { "Content-Type": "application/json" },
-      });
+      return jsonResponse([]);
     }
 
     const cacheKey = `search-lyrics:${q}:${limit}`;

@@ -1,3 +1,10 @@
+import {
+  GENERATION_HOURS,
+  NUM_GENERATIONS,
+  RELEASE_BASE_URL,
+  ROOMS_PER_RELEASE,
+} from "./config";
+
 export interface LyricRecord {
   id: number;
   name: string;
@@ -14,6 +21,8 @@ export interface LyricRecord {
   albumNameLower: string;
 }
 
+export const GENERATION_MS = GENERATION_HOURS * 3600 * 1000;
+
 export function prepareInput(text: string): string {
   const punct = /[`~!@#$%^&*()_|+\-=?;:",.<>{}[\]\\/\0\n]/g;
   let s = text.normalize("NFKC").toLowerCase();
@@ -23,7 +32,7 @@ export function prepareInput(text: string): string {
   return s;
 }
 
-export function hashPartition(artistName: string, trackName: string, numChunks: number): number {
+export function hashPartition(artistName: string, trackName: string, numRooms: number): number {
   const key = prepareInput(artistName) + " " + prepareInput(trackName);
   const bytes = new TextEncoder().encode(key);
   let h = 0x811c9dc5;
@@ -31,7 +40,58 @@ export function hashPartition(artistName: string, trackName: string, numChunks: 
     h ^= bytes[i];
     h = Math.imul(h, 0x01000193);
   }
-  return (h >>> 0) % numChunks;
+  return (h >>> 0) % numRooms;
+}
+
+export function currentGeneration(unixTimeMs: number): number {
+  return Math.floor(unixTimeMs / GENERATION_MS) % NUM_GENERATIONS;
+}
+
+export function generationStartTimeMs(unixTimeMs: number): number {
+  return Math.floor(unixTimeMs / GENERATION_MS) * GENERATION_MS;
+}
+
+export function generationEndTimeMs(unixTimeMs: number): number {
+  return generationStartTimeMs(unixTimeMs) + GENERATION_MS;
+}
+
+export function generationPhase(
+  unixTimeMs: number,
+  warmNextFraction: number,
+  routeSwitchFraction: number
+): "stable" | "warming-next" | "routing-next" {
+  const start = generationStartTimeMs(unixTimeMs);
+  const elapsed = unixTimeMs - start;
+  if (elapsed < GENERATION_MS * warmNextFraction) return "stable";
+  if (elapsed < GENERATION_MS * routeSwitchFraction) return "warming-next";
+  return "routing-next";
+}
+
+export function roomFileUrl(roomId: number, releaseTags: string[]): string {
+  const releaseIndex = Math.floor(roomId / ROOMS_PER_RELEASE);
+  const tag = releaseTags[releaseIndex];
+  if (!tag) {
+    throw new Error(`no release tag for room ${roomId} (releaseIndex ${releaseIndex})`);
+  }
+  return `${RELEASE_BASE_URL}/${tag}/room-${String(roomId).padStart(4, "0")}.json`;
+}
+
+export async function fetchRoomFile(url: string): Promise<Response> {
+  const first = await fetch(url, { redirect: "manual" });
+  if (first.status >= 300 && first.status < 400) {
+    const location = first.headers.get("location");
+    if (location) {
+      return fetch(location, { redirect: "follow" });
+    }
+  }
+  return first;
+}
+
+export interface RoomFilePayload {
+  room_id: number;
+  dump_key: string;
+  expected_count: number;
+  records: LyricRecord[];
 }
 
 export const DEFAULT_SEARCH_LIMIT = 20;
@@ -58,19 +118,23 @@ export type PartyStub = {
 
 let rpcSeq = 0;
 
-export async function warmRoom(
+export async function warmRoomRpc(
   stub: ReturnType<PartyStub["get"]>
 ): Promise<void> {
-  const ws = await stub.socket("/rpc");
-  ws.send(JSON.stringify({ id: ++rpcSeq, route: "warm", params: {} } satisfies RpcRequest));
-  await new Promise<void>((resolve) => {
-    const done = () => resolve();
-    ws.addEventListener("message", done);
-    setTimeout(done, 500);
-  });
   try {
-    ws.close();
-  } catch {}
+    const ws = await stub.socket("/rpc");
+    ws.send(JSON.stringify({ id: ++rpcSeq, route: "warm", params: {} } satisfies RpcRequest));
+    await new Promise<void>((resolve) => {
+      const done = () => resolve();
+      ws.addEventListener("message", done);
+      setTimeout(done, 800);
+    });
+    try {
+      ws.close();
+    } catch {}
+  } catch {
+    // unreachable; retried on a later tick
+  }
 }
 
 export async function rpcCall(

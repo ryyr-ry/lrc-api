@@ -34,9 +34,10 @@ GZIP_PATH = sys.argv[1]
 MANIFEST_PATH = sys.argv[2] if len(sys.argv) > 2 else "manifest.json"
 CONFIG_TS_PATH = sys.argv[3] if len(sys.argv) > 3 else "src/config.ts"
 CHUNK_DIR = sys.argv[4] if len(sys.argv) > 4 else "chunks"
+DUMP_KEY = sys.argv[5] if len(sys.argv) > 5 else "unknown"
 LYRICS_TEMP_PATH = "/tmp/lyrics_temp.zst"
 
-MAX_FILE_SIZE = 18 * 1024 * 1024
+ROOM_TARGET_JSON_BYTES = 48 * 1024 * 1024
 ZSTD_LEVEL = 3
 KNOWN_TRACK_COUNT = 32254478
 KNOWN_LYRICS_COUNT = 32680034
@@ -75,57 +76,42 @@ def dumps_json(obj):
 
 
 class RoomWriter:
-    __slots__ = ("room_idx", "chunk_dir", "part", "handle", "compressor",
-                 "uncompressed_size", "record_count", "files")
+    __slots__ = ("room_idx", "chunk_dir", "record_bytes", "record_count", "files")
 
     def __init__(self, room_idx, chunk_dir):
         self.room_idx = room_idx
         self.chunk_dir = chunk_dir
-        self.part = 0
-        self.handle = None
-        self.compressor = None
-        self.uncompressed_size = 0
+        self.record_bytes = bytearray()
         self.record_count = 0
         self.files = []
 
-    def _open_new_file(self):
-        path = os.path.join(self.chunk_dir, f"chunk-{self.room_idx}-{self.part}.json.zst")
-        self.handle = open(path, "wb")
-        cctx = zstandard.ZstdCompressor(level=ZSTD_LEVEL)
-        self.compressor = cctx.stream_writer(self.handle)
-        self.compressor.write(b"[")
-        self.uncompressed_size = 1
-        self.record_count = 0
-
     def write_record(self, json_bytes):
-        if self.compressor is None:
-            self._open_new_file()
         if self.record_count > 0:
-            self.compressor.write(b",")
-            self.uncompressed_size += 1
-        self.compressor.write(json_bytes)
-        self.uncompressed_size += len(json_bytes)
+            self.record_bytes.append(ord(","))
+        self.record_bytes.extend(json_bytes)
         self.record_count += 1
-        if self.uncompressed_size >= MAX_FILE_SIZE:
-            self._close_current_file()
-
-    def _close_current_file(self):
-        if self.compressor is None:
-            return
-        self.compressor.write(b"]")
-        self.uncompressed_size += 1
-        self.compressor.close()
-        self.handle = None
-        self.files.append({
-            "name": f"chunk-{self.room_idx}-{self.part}.json",
-            "size": self.uncompressed_size,
-        })
-        self.compressor = None
-        self.part += 1
 
     def flush(self):
-        if self.compressor is not None:
-            self._close_current_file()
+        if self.record_count == 0:
+            return
+        room_name = f"room-{self.room_idx:04d}.json"
+        path = os.path.join(self.chunk_dir, room_name)
+        with open(path, "wb") as f:
+            f.write(b"{")
+            f.write(b'"room_id":%d,' % self.room_idx)
+            f.write(b'"dump_key":%s,' % dumps_json(DUMP_KEY))
+            f.write(b'"expected_count":%d,' % self.record_count)
+            f.write(b'"records":[')
+            f.write(bytes(self.record_bytes))
+            f.write(b"]}")
+        size = os.path.getsize(path)
+        self.files.append({
+            "name": room_name,
+            "size": size,
+            "record_count": self.record_count,
+        })
+        self.record_bytes = bytearray()
+        self.record_count = 0
 
 
 def decode_tracks_record(payload, header_length, encoding, tracks_col_names):
@@ -287,7 +273,7 @@ def main():
 
     db_size = parser.page_size * parser.page_count
     estimated_total_json = int(db_size * 0.94)
-    room_target = 72 * 1024 * 1024
+    room_target = ROOM_TARGET_JSON_BYTES
     num_rooms = max(1, int(estimated_total_json / room_target))
     num_rooms = ((num_rooms + 99) // 100) * 100
     print(f"\nEstimated rooms: {num_rooms}", flush=True)
@@ -296,12 +282,20 @@ def main():
         print(f"ERROR: num_rooms ({num_rooms}) exceeds Uint16Array max (65535).", flush=True)
         sys.exit(1)
 
-    chunks_per_agg = 72
-    num_aggregators_raw = max(6, (num_rooms + chunks_per_agg - 1) // chunks_per_agg)
-    num_aggregators = ((num_aggregators_raw + 5) // 6) * 6
-    num_supers = 10
+    chunks_per_agg = 50
+    num_aggregators = max(1, (num_rooms + chunks_per_agg - 1) // chunks_per_agg)
+    num_supers = 2
+    subs_per_super = 4
+    num_subs = max(1, (num_aggregators + subs_per_super - 1) // subs_per_super)
+    num_aggregators = num_subs * subs_per_super
     print(f"  aggregators: {num_aggregators} (chunks_per_agg={chunks_per_agg})", flush=True)
+    print(f"  subs: {num_subs} (subs_per_super={subs_per_super})", flush=True)
     print(f"  supers: {num_supers}", flush=True)
+
+    rooms_per_release = 900
+    num_releases = (num_rooms + rooms_per_release - 1) // rooms_per_release
+    release_tags = [f"rooms-{time.strftime('%Y%m%d')}-r{i}" for i in range(num_releases)]
+    print(f"  releases: {num_releases} (rooms_per_release={rooms_per_release})", flush=True)
 
     global _NUM_ROOMS
     _NUM_ROOMS = num_rooms
@@ -846,16 +840,15 @@ def main():
     index_total_u16s = max_tid + 1
     num_index_parts = (index_total_u16s + INDEX_PART_U16S - 1) // INDEX_PART_U16S
     index_files = []
-    index_cctx = zstandard.ZstdCompressor(level=ZSTD_LEVEL)
     for part in range(num_index_parts):
         start_u16 = part * INDEX_PART_U16S
         end_u16 = min(start_u16 + INDEX_PART_U16S, index_total_u16s)
         chunk_arr = array.array("H", room_indices[start_u16:end_u16])
         raw_bytes = chunk_arr.tobytes()
         part_name = f"index-{part}.bin"
-        zst_path = os.path.join(CHUNK_DIR, part_name + ".zst")
-        with open(zst_path, "wb") as f:
-            f.write(index_cctx.compress(raw_bytes))
+        bin_path = os.path.join(CHUNK_DIR, part_name)
+        with open(bin_path, "wb") as f:
+            f.write(raw_bytes)
         index_files.append({
             "name": part_name,
             "size": len(raw_bytes),
@@ -881,17 +874,20 @@ def main():
     all_files.extend(index_files)
     print(f"Total files (chunks + index): {len(all_files)}", flush=True)
 
-    oversized = sum(1 for f in all_files if f["size"] > 20 * 1024 * 1024)
-    if oversized > 0:
-        print(f"WARNING: {oversized} files exceed 20 MB!", flush=True)
-        mx = max(f["size"] for f in all_files)
-        print(f"  Max: {mx} bytes ({mx/1048576:.2f} MB)", flush=True)
-
     manifest = {
+        "dump_key": DUMP_KEY,
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "total_records": total_records,
         "total_json_bytes": total_json_bytes,
         "total_files": len(all_files),
         "total_rooms": num_rooms,
+        "rooms_per_release": rooms_per_release,
+        "num_releases": num_releases,
+        "release_tags": release_tags,
+        "num_index_parts": num_index_parts,
+        "num_supers": num_supers,
+        "num_aggregators": num_aggregators,
+        "chunks_per_agg": chunks_per_agg,
         "files": all_files,
     }
 
@@ -906,12 +902,27 @@ def main():
     with open(CONFIG_TS_PATH, "w") as f:
         f.write("// AUTO-GENERATED by scripts/generate_manifest.py. Do not edit manually.\n")
         f.write(f"export const TOTAL_ROOMS = {num_rooms};\n")
-        f.write(f"export const TOTAL_FILES = {len(all_files)};\n")
-        f.write(f"export const NUM_CHUNKS = {num_rooms};\n")
+        f.write(f"export const ROOMS_PER_RELEASE = {rooms_per_release};\n")
+        f.write(f'export const RELEASE_BASE_URL = "https://github.com/ryyr-ry/lrc-api/releases/download";\n')
+        f.write(f"export const RELEASE_TAGS = [\n")
+        for tag in release_tags:
+            f.write(f'  "{tag}",\n')
+        f.write(f"];\n")
+        f.write(f"export const NUM_SUPERS = {num_supers};\n")
+        f.write(f"export const NUM_SUBS = {num_subs};\n")
         f.write(f"export const NUM_AGGREGATORS = {num_aggregators};\n")
         f.write(f"export const CHUNKS_PER_AGG = {chunks_per_agg};\n")
-        f.write(f"export const NUM_SUPERS = {num_supers};\n")
+        f.write(f"export const SUBS_PER_SUPER = {subs_per_super};\n")
         f.write(f"export const INDEX_FILES = {num_index_parts};\n")
+        f.write(f"export const GENERATION_HOURS = 3;\n")
+        f.write(f"export const NUM_GENERATIONS = 8;\n")
+        f.write(f"export const WARM_NEXT_FRACTION = 0.833;\n")
+        f.write(f"export const ROUTE_SWITCH_FRACTION = 0.917;\n")
+        f.write(f"export const LOAD_MAX_ATTEMPTS = 5;\n")
+        f.write(f"export const LOAD_RETRY_BASE_DELAY_MS = 2000;\n")
+        f.write(f'export const VERSION = "0.2.0";\n')
+        f.write(f'export const DB_LIST_URL = "https://lrclib-db-dumps.bu3nnyut4y9jfkdg.workers.dev/";\n')
+        f.write(f'export const WARM_CRON_NAME = "warm";\n')
     print(f"  config.ts written to {CONFIG_TS_PATH}", flush=True)
     print(f"  Total time: {time.time()-t0:.1f}s", flush=True)
 

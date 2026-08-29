@@ -1,137 +1,157 @@
 name: Deploy LRC API
 
 on:
-  push:
-    branches: [main]
+  schedule:
+    - cron: "0 */6 * * *"
   workflow_dispatch:
     inputs:
-      regenerate:
-        description: "Force regenerate chunks (skip Releases download)"
+      force:
+        description: "Force regeneration even if dump unchanged"
         required: false
         default: "false"
 
 env:
-  DUMP_URL: https://db-dumps.lrclib.net/lrclib-db-dump-20260807T082319Z.sqlite3.gz
+  DUMP_LIST_URL: https://lrclib-db-dumps.bu3nnyut4y9jfkdg.workers.dev/
   GZIP_PATH: /tmp/lrclib-db.sqlite3.gz
   MANIFEST_PATH: /tmp/manifest.json
-  CHUNK_DIR: /tmp/chunks
-  MOUNT_POINT: /tmp/fuse_data
-  PUBLIC_DIR: public/data
-  RELEASE_TAG: chunks-latest
+  CHUNK_DIR: /tmp/rooms
+  RELEASE_TAG: rooms-latest
 
 permissions:
   contents: write
 
 jobs:
-  generate:
-    name: Generate chunks and upload to Releases
+  detect:
+    name: Detect dump update
     runs-on: ubuntu-latest
-    if: |
-      (github.event_name == 'push' && contains(github.event.head_commit.message, '[regenerate]')) ||
-      (github.event_name == 'workflow_dispatch' && github.event.inputs.regenerate == 'true')
+    outputs:
+      dump_key: ${{ steps.detect.outputs.dump_key }}
+      dump_url: ${{ steps.detect.outputs.dump_url }}
+      changed: ${{ steps.detect.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Query dump list
+        id: detect
+        run: |
+          set -euo pipefail
+          LIST=$(curl -sS "$DUMP_LIST_URL")
+          KEY=$(echo "$LIST" | python3 -c "import json,sys; print(json.load(sys.stdin)['objects'][0]['key'])")
+          URL="${DUMP_LIST_URL}${KEY}"
+          echo "dump_key=$KEY" >> "$GITHUB_OUTPUT"
+          echo "dump_url=$URL" >> "$GITHUB_OUTPUT"
+          echo "Latest dump: $KEY"
+          PREV=$(curl -sS -L "https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/manifest.json" 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get('dump_key',''))" || echo "")
+          echo "Previous dump: ${PREV:-none}"
+          if [ "$KEY" != "$PREV" ] || [ "${{ github.event.inputs.force }}" = "true" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  generate:
+    name: Generate rooms and upload to Releases
+    runs-on: ubuntu-latest
+    needs: detect
+    if: needs.detect.outputs.changed == 'true'
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
-
-      - uses: oven-sh/setup-bun@v2
 
       - name: Install Python dependencies
         run: |
           pip install --no-cache-dir rapidgzip orjson zstandard
 
-      - name: Install Node dependencies
-        run: bun install
-
       - name: Download DB dump
         run: |
-          aria2c -x 16 -s 16 -d /tmp -o lrclib-db.sqlite3.gz "$DUMP_URL"
+          aria2c -x 16 -s 16 -d /tmp -o lrclib-db.sqlite3.gz "${{ needs.detect.outputs.dump_url }}"
 
-      - name: Generate manifest, chunk files, and index files
+      - name: Generate room files
         run: |
-          python scripts/generate_manifest.py "$GZIP_PATH" "$MANIFEST_PATH" "src/config.ts" "$CHUNK_DIR"
+          python scripts/generate_manifest.py "$GZIP_PATH" "$MANIFEST_PATH" "src/config.ts" "$CHUNK_DIR" "${{ needs.detect.outputs.dump_key }}"
 
-      - name: Clean up gzip to free disk
-        run: |
-          rm -f "$GZIP_PATH"
-          df -h /tmp
-
-      - name: Pack and upload to Releases (pipelined)
+      - name: Upload to Releases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
-          cd "$CHUNK_DIR"
+          python3 - "$CHUNK_DIR" "$MANIFEST_PATH" << 'EOF'
+          import json, os, subprocess, sys
+          chunk_dir = sys.argv[1]
+          manifest_path = sys.argv[2]
+          manifest = json.load(open(manifest_path))
+          rooms_per_release = manifest["rooms_per_release"]
+          release_tags = manifest["release_tags"]
+          files = manifest["files"]
 
-          python3 -c "
-          import os, sys
-          target = 1900 * 1024 * 1024
-          group, size = [], 0
-          for fn in sorted(os.listdir('.')):
-              s = os.path.getsize(fn)
-              if fn.startswith('part_') or fn.startswith('chunk_archive_'):
-                  continue
-              if size + s > target and group:
-                  print(':'.join(group))
-                  group, size = [], 0
-              group.append(fn)
-              size += s
-          if group:
-              print(':'.join(group))
-          " > /tmp/file_groups
+          room_files = [f for f in files if f["name"].startswith("room-")]
+          index_files = [f for f in files if f["name"].startswith("index-")]
 
-          NUM_GROUPS=$(wc -l < /tmp/file_groups)
-          echo "$NUM_GROUPS archive groups"
+          groups = {}
+          for f in room_files:
+              rid = int(f["name"].split("-")[1].split(".")[0])
+              ri = rid // rooms_per_release
+              groups.setdefault(ri, []).append(f["name"])
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+
+          def create_release(tag, title, notes):
+              subprocess.run(
+                  ["gh", "release", "delete", tag, "--yes", "--cleanup-tag"],
+                  check=False)
+              subprocess.run(
+                  ["gh", "release", "create", tag, "--repo", repo,
+                   "--title", title, "--notes", notes, "--prerelease", "--draft"],
+                  check=True)
+
+          def upload(tag, asset_paths):
+              if not asset_paths:
+                  return
+              cmd = ["gh", "release", "upload", tag,
+                     "--repo", repo, "--clobber"] + asset_paths
+              subprocess.run(cmd, cwd=chunk_dir, check=True)
+
+          def publish(tag):
+              subprocess.run(
+                  ["gh", "release", "edit", tag, "--draft=false", "--repo", repo],
+                  check=True)
+
+          for ri in sorted(groups):
+              tag = release_tags[ri]
+              notes = f"Room group {ri} for {manifest['dump_key']}"
+              print(f"Release {tag}: {len(groups[ri])} rooms", flush=True)
+              create_release(tag, f"Room data group {ri} (auto)", notes)
+              upload(tag, groups[ri])
+              publish(tag)
+
+          # index files go to the last release tag
+          last_tag = release_tags[-1]
+          print(f"Uploading {len(index_files)} index files to {last_tag}", flush=True)
+          upload(last_tag, [f["name"] for f in index_files])
+          EOF
 
           gh release delete "$RELEASE_TAG" --yes --cleanup-tag 2>/dev/null || true
-
           gh release create "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            --title "Chunk archives (auto)" \
-            --notes "Auto-generated chunk archives" \
+            --title "Room manifest (auto)" \
+            --notes "Manifest for ${{ needs.detect.outputs.dump_key }}" \
             --prerelease --draft
-
-          i=0
-          while IFS= read -r group; do
-              i=$((i+1))
-              part=$(printf "part_%04d.tar" "$i")
-              IFS=':' read -ra files <<< "$group"
-              tar cf "$part" "${files[@]}"
-              gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" "$part" --clobber
-              rm -f "$part" &
-              while [ "$(jobs -r | wc -l)" -ge 2 ]; do sleep 0.5; done
-          done < /tmp/file_groups
-          wait
-
-          ASSET_COUNT=$(gh release view "$RELEASE_TAG" \
-            --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets | length')
-          echo "Assets uploaded: $ASSET_COUNT"
-
-          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
-            "$GITHUB_WORKSPACE/src/config.ts" "$MANIFEST_PATH" --clobber
-
+          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+            "$MANIFEST_PATH" "src/config.ts"
           gh release edit "$RELEASE_TAG" --draft=false --repo "$GITHUB_REPOSITORY"
 
-          echo "Release published with $ASSET_COUNT archive parts + 2 metadata files"
+          echo "All release groups published"
 
   deploy:
-    name: Deploy to PartyKit (from Releases)
-    needs: generate
-    if: always()
+    name: Deploy to PartyKit
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    needs: [detect, generate]
+    if: |
+      always() &&
+      (needs.generate.result == 'success' || needs.detect.outputs.changed == 'false')
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-
-      - uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: false
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: true
 
       - uses: oven-sh/setup-bun@v2
 
@@ -141,71 +161,14 @@ jobs:
       - name: Download config.ts from release
         run: |
           if ! gh release download "$RELEASE_TAG" --pattern "config.ts" --dir src --clobber 2>/dev/null; then
-            echo "::warning::Release $RELEASE_TAG not found. Using checked-in config.ts. Run with [regenerate] to create it."
+            echo "::warning::Release $RELEASE_TAG not found. Using checked-in config.ts."
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Download manifest from release
-        run: |
-          mkdir -p /tmp
-          if ! gh release download "$RELEASE_TAG" --pattern "manifest.json" --dir /tmp --clobber 2>/dev/null; then
-            echo "::warning::manifest.json not found in release. Deploy may use stale data."
-          fi
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Install Python dependencies
-        run: |
-          pip install --no-cache-dir zstandard
-
-      - name: Download chunk archives (parallel)
-        run: |
-          mkdir -p "$CHUNK_DIR"
-          gh api repos/"$GITHUB_REPOSITORY"/releases/tags/"$RELEASE_TAG" \
-            --jq '.assets[] | select(.name | test("part_")) | .browser_download_url' \
-            > /tmp/urls.txt
-
-          URL_COUNT=$(wc -l < /tmp/urls.txt)
-          echo "Downloading $URL_COUNT archive parts..."
-
-          if [ "$URL_COUNT" -eq 0 ]; then
-            echo "::error::No chunk archives found in release $RELEASE_TAG. Trigger a workflow with [regenerate] in commit message first."
-            exit 1
-          fi
-
-          aria2c -x 16 -s 16 -j 8 -d "$CHUNK_DIR" -i /tmp/urls.txt
-
-          cd "$CHUNK_DIR"
-          ls part_*.tar | xargs -P 4 -I {} tar xf {}
-          rm -f part_*.tar
-          echo "Chunk files: $(ls | wc -l)"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Prepare public directory
-        run: |
-          mkdir -p public/data
-
-      - name: Decompress chunks to public/data
-        run: |
-          cd "$GITHUB_WORKSPACE"
-          for f in "$CHUNK_DIR"/*.zst; do
-            base=$(basename "$f" .zst)
-            zstd -d "$f" -o "public/data/$base"
-            rm "$f"
-          done
-          echo "Decompressed files: $(ls public/data | wc -l)"
-
-      - name: Deploy to PartyKit (direct)
+      - name: Deploy to PartyKit
         env:
           PARTYKIT_TOKEN: ${{ secrets.PARTYKIT_TOKEN }}
           PARTYKIT_LOGIN: ${{ secrets.PARTYKIT_LOGIN }}
         run: |
-          node scripts/deploy_direct.js
-
-      - name: Cleanup
-        if: always()
-        run: |
-          rm -f "$MANIFEST_PATH"
-          rm -rf "$PUBLIC_DIR" "$CHUNK_DIR"
+          bunx partykit deploy

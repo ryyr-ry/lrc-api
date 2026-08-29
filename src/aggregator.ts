@@ -1,15 +1,52 @@
-import { toApiResponse, DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT, rpcCall, RpcRequest } from "./types";
-import { TOTAL_ROOMS, NUM_AGGREGATORS, CHUNKS_PER_AGG } from "./config";
+import { rpcCall, RpcRequest, RpcResponse } from "./types";
+import {
+  TOTAL_ROOMS,
+  NUM_AGGREGATORS,
+  NUM_SUPERS,
+  NUM_SUBS,
+  CHUNKS_PER_AGG,
+  SUBS_PER_SUPER,
+} from "./config";
 import type { Request as PartyRequest, Room, Server, Connection } from "partykit/server";
 
-type ApiResponse = ReturnType<typeof toApiResponse>;
+function jsonResponse(data: unknown, status = 200): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function parseRoomId(roomId: string): {
+  level: "super" | "sub" | "agg";
+  generation: number;
+  index: number;
+} | null {
+  const match = roomId.match(/^(super|sub|agg)-(\d+)-(\d+)$/);
+  if (!match) return null;
+  return {
+    level: match[1] as "super" | "sub" | "agg",
+    generation: parseInt(match[2], 10),
+    index: parseInt(match[3], 10),
+  };
+}
 
 export default class AggregatorServer implements Server {
   room: Room;
+  generation = -1;
+  index = -1;
+  level: "super" | "sub" | "agg" = "agg";
 
   constructor(room: Room) {
     this.room = room;
+    const parsed = parseRoomId(room.id);
+    if (parsed) {
+      this.generation = parsed.generation;
+      this.index = parsed.index;
+      this.level = parsed.level;
+    }
   }
+
+  async onStart() {}
 
   async onMessage(message: string | ArrayBuffer, sender: Connection): Promise<void> {
     if (typeof message !== "string") return;
@@ -33,17 +70,16 @@ export default class AggregatorServer implements Server {
   }
 
   private async routeRpc(req: RpcRequest): Promise<{ status: number; body: string }> {
-    const isSuper = this.room.id.startsWith("super-");
     const params = req.params;
     if (req.route === "warm") {
-      return { status: 200, body: "OK" };
+      return { status: 200, body: JSON.stringify({ state: "ok" }) };
     }
     if (req.route === "search") {
-      const body = await this.doSearch(params, isSuper);
+      const body = await this.doSearch(params);
       return { status: 200, body };
     }
     if (req.route === "search-lyrics") {
-      const body = await this.doSearchLyrics(params, isSuper);
+      const body = await this.doSearchLyrics(params);
       return { status: 200, body };
     }
     return { status: 404, body: JSON.stringify({ error: "Not found" }) };
@@ -51,183 +87,161 @@ export default class AggregatorServer implements Server {
 
   async onRequest(req: PartyRequest): Promise<Response> {
     const url = new URL(req.url);
-    const path = url.pathname;
-    const segments = path.split("/");
+    const segments = url.pathname.split("/");
     const route = segments[segments.length - 1];
 
     if (route === "warm") {
-      return new Response("OK", { status: 200 });
+      return jsonResponse({ state: "ok" });
     }
 
-    const isSuper = this.room.id.startsWith("super-");
+    if (route === "info") {
+      return jsonResponse({
+        level: this.level,
+        generation: this.generation,
+        index: this.index,
+      });
+    }
+
     const params: Record<string, string> = {};
     for (const [k, v] of url.searchParams.entries()) {
       params[k] = v;
     }
 
     if (route === "search") {
-      const body = await this.doSearch(params, isSuper);
-      return new Response(body, { headers: { "Content-Type": "application/json" } });
+      const body = await this.doSearch(params);
+      return jsonResponse(JSON.parse(body));
     }
 
     if (route === "search-lyrics") {
-      const body = await this.doSearchLyrics(params, isSuper);
-      return new Response(body, { headers: { "Content-Type": "application/json" } });
+      const body = await this.doSearchLyrics(params);
+      return jsonResponse(JSON.parse(body));
     }
 
-    return new Response(JSON.stringify({ error: "Not found" }), {
-      status: 404,
-      headers: { "Content-Type": "application/json" },
-    });
+    return jsonResponse({ error: "Not found" }, 404);
   }
 
-  private async doSearch(params: Record<string, string>, isSuper: boolean): Promise<string> {
-    const q = params.q || null;
-    const trackName = params.track_name || null;
-    const artistName = params.artist_name || null;
-    const albumName = params.album_name || null;
-    const limit = Math.min(Math.max(parseInt(params.limit || String(DEFAULT_SEARCH_LIMIT), 10) || DEFAULT_SEARCH_LIMIT, 1), MAX_SEARCH_LIMIT);
+  private parseLimit(params: Record<string, string>): number {
+    return Math.min(
+      Math.max(parseInt(params.limit || "20", 10) || 20, 1),
+      100
+    );
+  }
 
-    const rpcParams: Record<string, string> = { limit: String(limit) };
-    if (q) rpcParams.q = q;
-    if (trackName) rpcParams.track_name = trackName;
-    if (artistName) rpcParams.artist_name = artistName;
-    if (albumName) rpcParams.album_name = albumName;
-
-    const allResults: ApiResponse[] = [];
+  private mergeResults(responses: (RpcResponse | null)[]): { results: unknown[]; errors: number } {
+    const results: unknown[] = [];
     let errors = 0;
-
-    if (isSuper) {
-      const aggParty = this.room.context.parties.aggregator;
-      const batchSize = 6;
-      for (let i = 0; i < NUM_AGGREGATORS; i += batchSize) {
-        const batch: Promise<{ status: number; body: string } | null>[] = [];
-        for (let j = i; j < Math.min(i + batchSize, NUM_AGGREGATORS); j++) {
-          batch.push(
-            rpcCall(aggParty.get(`agg-${j}`), "search", rpcParams).catch(() => null)
-          );
-        }
-        const responses = await Promise.all(batch);
-        for (const res of responses) {
-          if (res && res.status === 200) {
-            const text = res.body;
-            if (text && text !== "[]") {
-              try {
-                const items: unknown = JSON.parse(text);
-                if (Array.isArray(items)) {
-                  allResults.push(...(items as ApiResponse[]));
-                }
-              } catch {}
+    for (const res of responses) {
+      if (res && res.status === 200) {
+        const text = res.body;
+        if (text && text !== "[]") {
+          try {
+            const items: unknown = JSON.parse(text);
+            if (Array.isArray(items)) {
+              results.push(...items);
+            } else if (items && typeof items === "object" && Array.isArray((items as { results?: unknown[] }).results)) {
+              results.push(...(items as { results: unknown[] }).results);
+              errors += (items as { errors?: number }).errors ?? 0;
             }
-          } else {
-            errors++;
-          }
+          } catch {}
         }
-      }
-    } else {
-      const aggIndex = parseInt(this.room.id.replace("agg-", ""), 10);
-      if (isNaN(aggIndex)) return "[]";
-      const start = aggIndex * CHUNKS_PER_AGG;
-      const end = Math.min(start + CHUNKS_PER_AGG, TOTAL_ROOMS);
-      const chunkParty = this.room.context.parties.chunk;
-      const batchSize = 6;
-      for (let i = start; i < end; i += batchSize) {
-        const batch: Promise<{ status: number; body: string } | null>[] = [];
-        for (let j = i; j < Math.min(i + batchSize, end); j++) {
-          batch.push(
-            rpcCall(chunkParty.get(`chunk-${j}`), "search", rpcParams).catch(() => null)
-          );
-        }
-        const responses = await Promise.all(batch);
-        for (const res of responses) {
-          if (res && res.status === 200) {
-            const text = res.body;
-            if (text && text !== "[]") {
-              try {
-                const items: unknown = JSON.parse(text);
-                if (Array.isArray(items)) {
-                  allResults.push(...(items as ApiResponse[]));
-                }
-              } catch {}
-            }
-          } else {
-            errors++;
-          }
-        }
+      } else {
+        errors++;
       }
     }
-
-    allResults.sort((a, b) => a.id - b.id);
-    return JSON.stringify(allResults.slice(0, limit));
+    return { results, errors };
   }
 
-  private async doSearchLyrics(params: Record<string, string>, isSuper: boolean): Promise<string> {
-    const q = params.q || null;
-    const limit = Math.min(Math.max(parseInt(params.limit || String(DEFAULT_SEARCH_LIMIT), 10) || DEFAULT_SEARCH_LIMIT, 1), MAX_SEARCH_LIMIT);
+  private fanOut(
+    partyName: "aggregator" | "chunk",
+    roomIds: string[],
+    route: string,
+    params: Record<string, string>
+  ): Promise<RpcResponse | null>[] {
+    const party = this.room.context.parties[partyName];
+    return roomIds.map((id) =>
+      rpcCall(party.get(id), route, params, 60000).catch(() => null)
+    );
+  }
 
-    if (!q) return "[]";
-
-    const rpcParams: Record<string, string> = { q, limit: String(limit) };
-
-    const allResults: ApiResponse[] = [];
-
-    if (isSuper) {
-      const aggParty = this.room.context.parties.aggregator;
-      const batchSize = 6;
-      for (let i = 0; i < NUM_AGGREGATORS; i += batchSize) {
-        const batch: Promise<{ status: number; body: string } | null>[] = [];
-        for (let j = i; j < Math.min(i + batchSize, NUM_AGGREGATORS); j++) {
-          batch.push(
-            rpcCall(aggParty.get(`agg-${j}`), "search-lyrics", rpcParams).catch(() => null)
-          );
-        }
-        const responses = await Promise.all(batch);
-        for (const res of responses) {
-          if (res && res.status === 200) {
-            const text = res.body;
-            if (text && text !== "[]") {
-              try {
-                const items: unknown = JSON.parse(text);
-                if (Array.isArray(items)) {
-                  allResults.push(...(items as ApiResponse[]));
-                }
-              } catch {}
-            }
-          }
-        }
+  private async doSearch(params: Record<string, string>): Promise<string> {
+    const limit = this.parseLimit(params);
+    if (this.level === "super") {
+      const subIds: string[] = [];
+      const subsPer = Math.ceil(NUM_SUBS / NUM_SUPERS);
+      const subStart = this.index * subsPer;
+      const subEnd = Math.min(subStart + subsPer, NUM_SUBS);
+      for (let i = subStart; i < subEnd; i++) {
+        subIds.push(`sub-${this.generation}-${i}`);
       }
-    } else {
-      const aggIndex = parseInt(this.room.id.replace("agg-", ""), 10);
-      if (isNaN(aggIndex)) return "[]";
-      const start = aggIndex * CHUNKS_PER_AGG;
-      const end = Math.min(start + CHUNKS_PER_AGG, TOTAL_ROOMS);
-      const chunkParty = this.room.context.parties.chunk;
-      const batchSize = 6;
-      for (let i = start; i < end; i += batchSize) {
-        const batch: Promise<{ status: number; body: string } | null>[] = [];
-        for (let j = i; j < Math.min(i + batchSize, end); j++) {
-          batch.push(
-            rpcCall(chunkParty.get(`chunk-${j}`), "search-lyrics", rpcParams).catch(() => null)
-          );
-        }
-        const responses = await Promise.all(batch);
-        for (const res of responses) {
-          if (res && res.status === 200) {
-            const text = res.body;
-            if (text && text !== "[]") {
-              try {
-                const items: unknown = JSON.parse(text);
-                if (Array.isArray(items)) {
-                  allResults.push(...(items as ApiResponse[]));
-                }
-              } catch {}
-            }
-          }
-        }
-      }
+      const responses = await Promise.all(this.fanOut("aggregator", subIds, "search", params));
+      const { results, errors } = this.mergeResults(responses);
+      results.sort((a, b) => (a as { id: number }).id - (b as { id: number }).id);
+      return JSON.stringify({ results: results.slice(0, limit), errors });
     }
 
-    allResults.sort((a, b) => a.id - b.id);
-    return JSON.stringify(allResults.slice(0, limit));
+    if (this.level === "sub") {
+      const aggIds: string[] = [];
+      for (let i = 0; i < SUBS_PER_SUPER; i++) {
+        const aggIndex = this.index * SUBS_PER_SUPER + i;
+        if (aggIndex >= NUM_AGGREGATORS) break;
+        aggIds.push(`agg-${this.generation}-${aggIndex}`);
+      }
+      const responses = await Promise.all(this.fanOut("aggregator", aggIds, "search", params));
+      const { results, errors } = this.mergeResults(responses);
+      results.sort((a, b) => (a as { id: number }).id - (b as { id: number }).id);
+      return JSON.stringify({ results: results.slice(0, limit), errors });
+    }
+
+    const chunkIds: string[] = [];
+    const start = this.index * CHUNKS_PER_AGG;
+    const end = Math.min(start + CHUNKS_PER_AGG, TOTAL_ROOMS);
+    for (let j = start; j < end; j++) {
+      chunkIds.push(`chunk-${this.generation}-${j}`);
+    }
+    const responses = await Promise.all(this.fanOut("chunk", chunkIds, "search", params));
+    const { results, errors } = this.mergeResults(responses);
+    results.sort((a, b) => (a as { id: number }).id - (b as { id: number }).id);
+    return JSON.stringify({ results: results.slice(0, limit), errors });
+  }
+
+  private async doSearchLyrics(params: Record<string, string>): Promise<string> {
+    const limit = this.parseLimit(params);
+    if (this.level === "super") {
+      const subIds: string[] = [];
+      const subsPer = Math.ceil(NUM_SUBS / NUM_SUPERS);
+      const subStart = this.index * subsPer;
+      const subEnd = Math.min(subStart + subsPer, NUM_SUBS);
+      for (let i = subStart; i < subEnd; i++) {
+        subIds.push(`sub-${this.generation}-${i}`);
+      }
+      const responses = await Promise.all(this.fanOut("aggregator", subIds, "search-lyrics", params));
+      const { results, errors } = this.mergeResults(responses);
+      results.sort((a, b) => (a as { id: number }).id - (b as { id: number }).id);
+      return JSON.stringify({ results: results.slice(0, limit), errors });
+    }
+
+    if (this.level === "sub") {
+      const aggIds: string[] = [];
+      for (let i = 0; i < SUBS_PER_SUPER; i++) {
+        const aggIndex = this.index * SUBS_PER_SUPER + i;
+        if (aggIndex >= NUM_AGGREGATORS) break;
+        aggIds.push(`agg-${this.generation}-${aggIndex}`);
+      }
+      const responses = await Promise.all(this.fanOut("aggregator", aggIds, "search-lyrics", params));
+      const { results, errors } = this.mergeResults(responses);
+      results.sort((a, b) => (a as { id: number }).id - (b as { id: number }).id);
+      return JSON.stringify({ results: results.slice(0, limit), errors });
+    }
+
+    const chunkIds: string[] = [];
+    const start = this.index * CHUNKS_PER_AGG;
+    const end = Math.min(start + CHUNKS_PER_AGG, TOTAL_ROOMS);
+    for (let j = start; j < end; j++) {
+      chunkIds.push(`chunk-${this.generation}-${j}`);
+    }
+    const responses = await Promise.all(this.fanOut("chunk", chunkIds, "search-lyrics", params));
+    const { results, errors } = this.mergeResults(responses);
+    results.sort((a, b) => (a as { id: number }).id - (b as { id: number }).id);
+    return JSON.stringify({ results: results.slice(0, limit), errors });
   }
 }

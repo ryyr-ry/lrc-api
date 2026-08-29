@@ -1,7 +1,7 @@
 {
   "name": "partykit-slot-test",
   "main": "src/server.ts",
-  "serve": { "path": "public" },
+  "compatibilityDate": "2026-08-29",
   "crons": {
     "warm": "* * * * *"
   },
