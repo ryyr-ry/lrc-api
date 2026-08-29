@@ -127,7 +127,7 @@ export async function warmRoomRpc(
     await new Promise<void>((resolve) => {
       const done = () => resolve();
       ws.addEventListener("message", done);
-      setTimeout(done, 800);
+      setTimeout(done, 200);
     });
     try {
       ws.close();

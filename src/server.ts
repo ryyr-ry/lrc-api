@@ -288,16 +288,26 @@ function handlePostEndpoint(): Response {
   );
 }
 
-async function warmGeneration(lobby: CronLobby, gen: number): Promise<void> {
+async function warmGeneration(lobby: CronLobby, gen: number, deadlineMs: number, rotateBy: number): Promise<void> {
   const warmBatch = 32;
   const chunkParty = lobby.parties.chunk;
-  for (let i = 0; i < TOTAL_ROOMS; i += warmBatch) {
+  const total = TOTAL_ROOMS;
+
+  const order: number[] = [];
+  for (let i = 0; i < total; i++) {
+    order.push((i + rotateBy) % total);
+  }
+
+  for (let i = 0; i < total; i += warmBatch) {
+    if (Date.now() > deadlineMs) return;
     const batch: Promise<void>[] = [];
-    for (let j = i; j < Math.min(i + warmBatch, TOTAL_ROOMS); j++) {
-      batch.push(warmRoomRpc(chunkParty.get(chunkRoomId(gen, j))));
+    for (let j = i; j < Math.min(i + warmBatch, total); j++) {
+      batch.push(warmRoomRpc(chunkParty.get(chunkRoomId(gen, order[j]))));
     }
     await Promise.all(batch);
   }
+
+  if (Date.now() > deadlineMs) return;
 
   const aggParty = lobby.parties.aggregator;
   const aggBatch: Promise<void>[] = [];
@@ -378,15 +388,21 @@ export default {
     const now = Date.now();
     const gen = currentGeneration(now);
     const phase = generationPhase(now, WARM_NEXT_FRACTION, ROUTE_SWITCH_FRACTION);
+    const deadline = now + 50 * 1000;
 
-    await warmGeneration(lobby, gen);
+    const minuteOfHour = new Date(now).getMinutes();
+    const rotateBy = (minuteOfHour * 64) % TOTAL_ROOMS;
 
-    if (phase !== "stable") {
+    await warmGeneration(lobby, gen, deadline, rotateBy);
+
+    if (phase !== "stable" && Date.now() <= deadline) {
       const nextGen = (gen + 1) % NUM_GENERATIONS;
-      await warmGeneration(lobby, nextGen);
+      await warmGeneration(lobby, nextGen, deadline, rotateBy);
     }
 
-    const indexParty = lobby.parties.index;
-    await warmRoomRpc(indexParty.get("index-0"));
+    if (Date.now() <= deadline) {
+      const indexParty = lobby.parties.index;
+      await warmRoomRpc(indexParty.get("index-0"));
+    }
   },
 } satisfies PartyKitServer;
