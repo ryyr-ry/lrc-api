@@ -77,7 +77,7 @@ jobs:
       - name: Build generator
         run: |
           cd rust-parser
-          cargo build --release
+          cargo build --release --features zlib-ng
 
       - name: Install Python dependencies
         run: |

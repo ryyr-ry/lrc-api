@@ -7,8 +7,13 @@ edition = "2021"
 name = "lrc-room-generator"
 path = "src/main.rs"
 
+[features]
+default = ["rust_backend"]
+rust_backend = ["flate2/rust_backend"]
+zlib-ng = ["flate2/zlib-ng"]
+
 [dependencies]
-flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+flate2 = { version = "1", default-features = false }
 rayon = "1"
 unicode-normalization = "0.1"
 memmap2 = "0.9"
