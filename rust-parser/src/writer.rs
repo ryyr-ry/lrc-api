@@ -15,11 +15,13 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 
 const ROOM_BUFFER_LIMIT: usize = 32 * 1024 * 1024;
+const GLOBAL_BUFFER_CAP: usize = 512 * 1024 * 1024;
 
 pub struct RoomWriter {
     dir: String,
     dump_key: String,
     rooms: HashMap<u32, RoomState>,
+    total_buffered: usize,
     pub file_count: usize,
     pub total_records: u64,
     pub total_json_bytes: u64,
@@ -38,19 +40,43 @@ impl RoomWriter {
             dir: dir.to_string(),
             dump_key: dump_key.to_string(),
             rooms: HashMap::new(),
+            total_buffered: 0,
             file_count: 0,
             total_records: 0,
             total_json_bytes: 0,
         }
     }
 
+    fn spill_largest(&mut self) {
+        let mut largest_id = 0u32;
+        let mut largest_len = 0usize;
+        for (id, st) in self.rooms.iter() {
+            if st.buffer.len() > largest_len {
+                largest_len = st.buffer.len();
+                largest_id = *id;
+            }
+        }
+        if largest_len == 0 {
+            return;
+        }
+        let dir = self.dir.clone();
+        let st = self.rooms.get_mut(&largest_id).unwrap();
+        let part_path = format!("{}/room-{:04}.part{:03}", dir, largest_id, st.part_idx);
+        let mut f = BufWriter::new(File::create(&part_path).expect("create part file"));
+        f.write_all(&st.buffer).expect("write part");
+        f.flush().expect("flush part");
+        self.total_buffered -= st.buffer.len();
+        st.buffer.clear();
+        st.buffer.shrink_to_fit();
+        st.part_idx += 1;
+    }
+
     pub fn write_record(&mut self, room_id: u32, json_bytes: &[u8]) {
         self.total_records += 1;
         self.total_json_bytes += json_bytes.len() as u64;
 
-        let dir = self.dir.clone();
         let state = self.rooms.entry(room_id).or_insert_with(|| RoomState {
-            buffer: Vec::with_capacity(ROOM_BUFFER_LIMIT),
+            buffer: Vec::with_capacity(1024 * 1024),
             count: 0,
             part_idx: 0,
         });
@@ -60,14 +86,20 @@ impl RoomWriter {
         }
         state.buffer.extend_from_slice(json_bytes);
         state.count += 1;
+        self.total_buffered += json_bytes.len() + 1;
 
         if state.buffer.len() >= ROOM_BUFFER_LIMIT {
+            let dir = self.dir.clone();
             let part_path = format!("{}/room-{:04}.part{:03}", dir, room_id, state.part_idx);
             let mut f = BufWriter::new(File::create(&part_path).expect("create part file"));
             f.write_all(&state.buffer).expect("write part");
             f.flush().expect("flush part");
+            self.total_buffered -= state.buffer.len();
             state.buffer.clear();
+            state.buffer.shrink_to_fit();
             state.part_idx += 1;
+        } else if self.total_buffered > GLOBAL_BUFFER_CAP {
+            self.spill_largest();
         }
     }
 

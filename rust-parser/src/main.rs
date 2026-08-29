@@ -255,6 +255,103 @@ fn build_record_json(tid: u64, meta: &TrackMeta, lyrics: Option<&LyricsMeta>) ->
     out
 }
 
+#[allow(clippy::too_many_arguments)]
+fn process_assembled(
+    payload: &[u8],
+    rowid: u64,
+    tracks_ncols: usize,
+    lyrics_ncols: usize,
+    tracks_map: &ColumnMap,
+    lyrics_map: &LyricsColumnMap,
+    max_tid: &mut usize,
+    max_lid: &mut usize,
+    track_names: &mut Vec<String>,
+    track_artists: &mut Vec<String>,
+    track_albums: &mut Vec<String>,
+    track_durations: &mut Vec<f64>,
+    room_indices: &mut Vec<u32>,
+    next_track: &mut Vec<u32>,
+    matched: &mut Vec<u8>,
+    lyrics_first: &mut Vec<u32>,
+    null_ids: &mut Vec<u32>,
+    lyrics_offset: &mut Vec<u64>,
+    lyrics_compressed_len: &mut Vec<u64>,
+    lyrics_instrumental: &mut Vec<u8>,
+    lyrics_temp_offset: &mut u64,
+    num_rooms: u32,
+    tc: &mut u64,
+    lc: &mut u64,
+) -> bool {
+    let Some(mut cell) = sqlite::decode_record(payload.to_vec()) else {
+        return false;
+    };
+    cell.rowid = rowid;
+    if cell.ncols == tracks_ncols {
+        let t = cell.rowid as usize;
+        if t > *max_tid {
+            let new_len = t + 1;
+            track_names.resize(new_len, String::new());
+            track_artists.resize(new_len, String::new());
+            track_albums.resize(new_len, String::new());
+            track_durations.resize(new_len, 0.0);
+            room_indices.resize(new_len, 0);
+            next_track.resize(new_len, 0);
+            matched.resize(new_len, 0);
+            *max_tid = t;
+        }
+        let meta = decode_tracks(&cell, tracks_map);
+        track_names[t] = meta.name.clone();
+        track_artists[t] = meta.artist.clone();
+        track_albums[t] = meta.album.clone();
+        track_durations[t] = meta.duration;
+        room_indices[t] = partition::hash_partition(&meta.artist, &meta.name, num_rooms);
+        if let Some(lid) = meta.last_lid {
+            let l = lid as usize;
+            if l > *max_lid {
+                let new_len = l + 1;
+                lyrics_first.resize(new_len, 0);
+                lyrics_offset.resize(new_len, 0);
+                lyrics_compressed_len.resize(new_len, 0);
+                lyrics_instrumental.resize(new_len, 0);
+                *max_lid = l;
+            }
+            next_track[t] = lyrics_first[l];
+            lyrics_first[l] = t as u32;
+        } else {
+            null_ids.push(t as u32);
+        }
+        *tc += 1;
+        true
+    } else if cell.ncols == lyrics_ncols {
+        let l = cell.rowid as usize;
+        if l > *max_lid {
+            let new_len = l + 1;
+            lyrics_first.resize(new_len, 0);
+            lyrics_offset.resize(new_len, 0);
+            lyrics_compressed_len.resize(new_len, 0);
+            lyrics_instrumental.resize(new_len, 0);
+            *max_lid = l;
+        }
+        let meta = decode_lyrics(&cell, lyrics_map);
+        lyrics_instrumental[l] = if meta.instrumental { 1 } else { 0 };
+        let raw = lyrics_to_bytes(&meta);
+        let compressed =
+            zstd::stream::encode_all(raw.as_slice(), 3).expect("compress lyrics");
+        lyrics_offset[l] = *lyrics_temp_offset;
+        lyrics_compressed_len[l] = compressed.len() as u64;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(LYRICS_TEMP)
+            .expect("append lyrics temp");
+        f.write_all(&compressed).expect("append lyrics");
+        *lyrics_temp_offset += compressed.len() as u64;
+        *lc += 1;
+        true
+    } else {
+        false
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 6 {
@@ -318,8 +415,8 @@ fn main() {
         .collect();
 
     // --- scan structures ---
-    let max_tid = KNOWN_TRACK_COUNT as usize;
-    let max_lid = (KNOWN_LYRICS_COUNT + 100_000) as usize;
+    let mut max_tid = KNOWN_TRACK_COUNT as usize;
+    let mut max_lid = (KNOWN_LYRICS_COUNT + 100_000) as usize;
 
     let mut track_names: Vec<String> = vec![String::new(); max_tid + 1];
     let mut track_artists: Vec<String> = vec![String::new(); max_tid + 1];
@@ -330,19 +427,58 @@ fn main() {
     let mut next_track: Vec<u32> = vec![0; max_tid + 1];
     let mut lyrics_first: Vec<u32> = vec![0; max_lid + 1];
     let mut null_ids: Vec<u32> = Vec::new();
+    let mut lyrics_offset: Vec<u64> = vec![0; max_lid + 1];
+    let mut lyrics_compressed_len: Vec<u64> = vec![0; max_lid + 1];
+    let mut lyrics_instrumental: Vec<u8> = vec![0; max_lid + 1];
+
+    macro_rules! grow_tid {
+        ($tid:expr) => {{
+            let t = $tid as usize;
+            if t > max_tid {
+                let new_len = t + 1;
+                track_names.resize(new_len, String::new());
+                track_artists.resize(new_len, String::new());
+                track_albums.resize(new_len, String::new());
+                track_durations.resize(new_len, 0.0);
+                room_indices.resize(new_len, 0);
+                matched.resize(new_len, 0);
+                next_track.resize(new_len, 0);
+                max_tid = t;
+            }
+            t
+        }};
+    }
+
+    macro_rules! grow_lid {
+        ($lid:expr) => {{
+            let l = $lid as usize;
+            if l > max_lid {
+                let new_len = l + 1;
+                lyrics_first.resize(new_len, 0);
+                lyrics_offset.resize(new_len, 0);
+                lyrics_compressed_len.resize(new_len, 0);
+                lyrics_instrumental.resize(new_len, 0);
+                max_lid = l;
+            }
+            l
+        }};
+    }
 
     // lyrics zstd spill: each record is an independent zstd frame written
     // sequentially; lengths are recorded for the join phase read-back.
     let lyrics_temp_file =
         std::fs::File::create(LYRICS_TEMP).expect("create lyrics temp");
     let mut lyrics_writer = BufWriter::with_capacity(1 << 20, lyrics_temp_file);
-    let mut lyrics_offset: Vec<u64> = vec![0; max_lid + 1];
-    let mut lyrics_compressed_len: Vec<u64> = vec![0; max_lid + 1];
-    let mut lyrics_instrumental: Vec<u8> = vec![0; max_lid + 1];
     let mut lyrics_temp_offset: u64 = 0;
 
     let mut ring = sqlite::RingBuffer::new(RING_PAGES);
     let mut pending: Vec<sqlite::PendingOverflow> = Vec::new();
+    // Overflow local payloads spill to disk; only metadata stays in
+    // memory (Python's pending_overflows.bin equivalent).
+    let pending_spill_path = "/tmp/pending_overflows.bin";
+    let pending_spill_file =
+        std::fs::File::create(pending_spill_path).expect("create pending spill");
+    let mut pending_spill = BufWriter::with_capacity(1 << 20, pending_spill_file);
 
     // --- sequential scan ---
     eprintln!("scanning {} pages...", page_count);
@@ -396,45 +532,51 @@ fn main() {
             for cell in cells {
                 if cell.ncols == tracks_ncols {
                     let tid = cell.rowid;
-                    if tid as usize > max_tid {
-                        continue;
-                    }
+                    let tidx = grow_tid!(tid);
                     let meta = decode_tracks(&cell, &tracks_map);
-                    track_names[tid as usize] = meta.name.clone();
-                    track_artists[tid as usize] = meta.artist.clone();
-                    track_albums[tid as usize] = meta.album.clone();
-                    track_durations[tid as usize] = meta.duration;
+                    track_names[tidx] = meta.name.clone();
+                    track_artists[tidx] = meta.artist.clone();
+                    track_albums[tidx] = meta.album.clone();
+                    track_durations[tidx] = meta.duration;
                     let ridx = partition::hash_partition(&meta.artist, &meta.name, num_rooms);
-                    room_indices[tid as usize] = ridx;
+                    room_indices[tidx] = ridx;
 
                     if let Some(lid) = meta.last_lid {
-                        if (lid as usize) < lyrics_first.len() {
-                            next_track[tid as usize] = lyrics_first[lid as usize];
-                            lyrics_first[lid as usize] = tid as u32;
-                        }
+                        let lidx = grow_lid!(lid);
+                        next_track[tidx] = lyrics_first[lidx];
+                        lyrics_first[lidx] = tid as u32;
                     } else {
                         null_ids.push(tid as u32);
                     }
                     tc += 1;
                 } else if cell.ncols == lyrics_ncols {
                     let lid = cell.rowid;
-                    if (lid as usize) < lyrics_first.len() {
-                        let meta = decode_lyrics(&cell, &lyrics_map);
-                        lyrics_instrumental[lid as usize] = if meta.instrumental { 1 } else { 0 };
-                        let raw = lyrics_to_bytes(&meta);
-                        let compressed = zstd::stream::encode_all(raw.as_slice(), 3)
-                            .expect("compress lyrics");
-                        lyrics_offset[lid as usize] = lyrics_temp_offset;
-                        lyrics_compressed_len[lid as usize] = compressed.len() as u64;
-                        lyrics_writer
-                            .write_all(&compressed)
-                            .expect("write lyrics temp");
-                        lyrics_temp_offset += compressed.len() as u64;
-                        lc += 1;
-                    }
+                    let lidx = grow_lid!(lid);
+                    let meta = decode_lyrics(&cell, &lyrics_map);
+                    lyrics_instrumental[lidx] = if meta.instrumental { 1 } else { 0 };
+                    let raw = lyrics_to_bytes(&meta);
+                    let compressed = zstd::stream::encode_all(raw.as_slice(), 3)
+                        .expect("compress lyrics");
+                    lyrics_offset[lidx] = lyrics_temp_offset;
+                    lyrics_compressed_len[lidx] = compressed.len() as u64;
+                    lyrics_writer
+                        .write_all(&compressed)
+                        .expect("write lyrics temp");
+                    lyrics_temp_offset += compressed.len() as u64;
+                    lc += 1;
                 }
             }
+            let new_pending_start = pending.len();
             pending.append(&mut unresolved);
+            // Spill local payloads of new pending entries to disk and
+            // drop them from memory.
+            for p in pending.iter_mut().skip(new_pending_start) {
+                let off = pending_spill.stream_position().expect("spill pos");
+                p.spill_offset = off;
+                pending_spill.write_all(&p.local_payload).expect("spill payload");
+                p.local_payload.clear();
+                p.local_payload.shrink_to_fit();
+            }
             overflow_pending_count = pending.len() as u64;
         }
 
@@ -464,19 +606,50 @@ fn main() {
     drop(lyrics_writer);
     eprintln!("lyrics temp: {} bytes", lyrics_temp_offset);
 
-    // Delete the gzip NOW to reclaim 46 GB before the join phase.
-    drop(gz);
-    std::fs::remove_file(gz_path).ok();
-    eprintln!("gzip deleted");
-
-    // --- Pass 2: resolve pending overflows with one sequential pass ---
+    // --- Pass 2: resolve pending overflows with one sequential sweep ---
+    // Chains are assembled via a waiting map: when a chain's page
+    // arrives in the sweep, its data is kept until the chain resolves.
+    // Chains whose pages were already swept are resolved from the ring
+    // buffer when possible, else reported unresolved.
     if !pending.is_empty() {
         eprintln!("pass 2: resolving {} pending overflows", pending.len());
         pending.sort_by_key(|p| p.ovfl_page);
-        let mut pending_by_page: HashMap<u32, Vec<usize>> = HashMap::new();
-        for (i, p) in pending.iter().enumerate() {
-            pending_by_page.entry(p.ovfl_page).or_default().push(i);
+
+        // chain state: (spill_offset, total_size, local_len, next_page, resolved)
+        struct ChainState {
+            spill_offset: u64,
+            total_size: usize,
+            local_len: usize,
+            next_page: u32,
+            rowid: u64,
+            resolved: bool,
         }
+        let mut chains: Vec<ChainState> = pending
+            .iter()
+            .map(|p| ChainState {
+                spill_offset: p.spill_offset,
+                total_size: p.total_payload_size,
+                local_len: p.local_payload.len(),
+                next_page: p.ovfl_page,
+                rowid: p.rowid,
+                resolved: false,
+            })
+            .collect();
+
+        // waiting: page -> chain indices that need this page's data
+        let mut waiting: HashMap<u32, Vec<usize>> = HashMap::new();
+        for (i, c) in chains.iter().enumerate() {
+            if c.next_page != 0 && c.local_len < c.total_size {
+                waiting.entry(c.next_page).or_default().push(i);
+            }
+        }
+
+        let spill_reader_file =
+            std::fs::File::open(pending_spill_path).expect("open pending spill");
+        let mut spill_reader = BufReader::with_capacity(1 << 20, spill_reader_file);
+
+        // assembled payload buffer per chain (only while being resolved)
+        let mut assembled: Vec<Option<Vec<u8>>> = vec![None; chains.len()];
 
         let mut gz2 = GzDecoder::new(BufReader::with_capacity(
             1 << 20,
@@ -499,86 +672,90 @@ fn main() {
                     Err(_) => break,
                 }
             }
-            // Feed the ring buffer so chains can resolve forward.
-            if pn != 1 {
-                ring.put(pn, page.clone());
-            }
-            if let Some(idxs) = pending_by_page.get(&pn) {
-                for &i in idxs {
-                    if pending[i].resolved {
+            ring.put(pn, page.clone());
+
+            if let Some(idxs) = waiting.remove(&pn) {
+                for &i in &idxs {
+                    if chains[i].resolved {
                         continue;
                     }
-                    let mut payload = pending[i].local_payload.clone();
-                    let mut remaining = pending[i].total_payload_size - payload.len();
-                    let mut current = pn;
+                    // Ensure the local payload is loaded into assembled.
+                    if assembled[i].is_none() {
+                        let mut local = vec![0u8; chains[i].local_len];
+                        spill_reader
+                            .seek(SeekFrom::Start(chains[i].spill_offset))
+                            .ok();
+                        spill_reader.read_exact(&mut local).ok();
+                        assembled[i] = Some(local);
+                    }
+                    let mut buf = assembled[i].take().unwrap();
+                    let mut remaining = chains[i].total_size - buf.len();
+                    let mut current = chains[i].next_page;
                     let mut chain_ok = true;
                     let mut sweep = 0usize;
                     while current != 0 && remaining > 0 && sweep < 8 {
-                        let Some(data) = ring.get(current) else {
-                            chain_ok = false;
-                            break;
+                        let data = match ring.get(current) {
+                            Some(d) => d,
+                            None => {
+                                // Not in ring: if this page is still
+                                // ahead, keep waiting.
+                                chain_ok = false;
+                                break;
+                            }
                         };
                         let next = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
                         let chunk = remaining.min(usable_size - 4);
                         let take = chunk.min(data.len() - 4);
-                        payload.extend_from_slice(&data[4..4 + take]);
+                        buf.extend_from_slice(&data[4..4 + take]);
                         remaining -= take;
                         current = next;
                         sweep += 1;
                     }
                     if chain_ok && remaining == 0 {
-                        if let Some(mut cell) = sqlite::decode_record(payload) {
-                            cell.rowid = pending[i].rowid;
-                            if cell.ncols == tracks_ncols {
-                                let tid = cell.rowid;
-                                if (tid as usize) <= max_tid {
-                                    let meta = decode_tracks(&cell, &tracks_map);
-                                    track_names[tid as usize] = meta.name.clone();
-                                    track_artists[tid as usize] = meta.artist.clone();
-                                    track_albums[tid as usize] = meta.album.clone();
-                                    track_durations[tid as usize] = meta.duration;
-                                    room_indices[tid as usize] = partition::hash_partition(
-                                        &meta.artist,
-                                        &meta.name,
-                                        num_rooms,
-                                    );
-                                    if let Some(lid) = meta.last_lid {
-                                        if (lid as usize) < lyrics_first.len() {
-                                            next_track[tid as usize] =
-                                                lyrics_first[lid as usize];
-                                            lyrics_first[lid as usize] = tid as u32;
-                                        }
-                                    } else {
-                                        null_ids.push(tid as u32);
-                                    }
-                                    tc += 1;
-                                    pending[i].resolved = true;
-                                    resolved += 1;
-                                }
-                            } else if cell.ncols == lyrics_ncols {
-                                let lid = cell.rowid;
-                                if (lid as usize) < lyrics_first.len() {
-                                    let meta = decode_lyrics(&cell, &lyrics_map);
-                                    lyrics_instrumental[lid as usize] =
-                                        if meta.instrumental { 1 } else { 0 };
-                                    let raw = lyrics_to_bytes(&meta);
-                                    let compressed = zstd::stream::encode_all(raw.as_slice(), 3)
-                                        .expect("compress lyrics");
-                                    lyrics_offset[lid as usize] = lyrics_temp_offset;
-                                    lyrics_compressed_len[lid as usize] =
-                                        compressed.len() as u64;
-                                    // reopen temp for append
-                                    let mut f = std::fs::OpenOptions::new()
-                                        .append(true)
-                                        .open(LYRICS_TEMP)
-                                        .expect("append lyrics temp");
-                                    f.write_all(&compressed).expect("append lyrics");
-                                    lyrics_temp_offset += compressed.len() as u64;
-                                    lc += 1;
-                                    pending[i].resolved = true;
-                                    resolved += 1;
-                                }
-                            }
+                        // Fully assembled. Process the record.
+                        if process_assembled(
+                            &buf,
+                            chains[i].rowid,
+                            tracks_ncols,
+                            lyrics_ncols,
+                            &tracks_map,
+                            &lyrics_map,
+                            &mut max_tid,
+                            &mut max_lid,
+                            &mut track_names,
+                            &mut track_artists,
+                            &mut track_albums,
+                            &mut track_durations,
+                            &mut room_indices,
+                            &mut next_track,
+                            &mut matched,
+                            &mut lyrics_first,
+                            &mut null_ids,
+                            &mut lyrics_offset,
+                            &mut lyrics_compressed_len,
+                            &mut lyrics_instrumental,
+                            &mut lyrics_temp_offset,
+                            num_rooms,
+                            &mut tc,
+                            &mut lc,
+                        ) {
+                            chains[i].resolved = true;
+                            resolved += 1;
+                        }
+                        assembled[i] = None;
+                    } else {
+                        // Keep the buffer and wait for the next page.
+                        assembled[i] = Some(buf);
+                        // remaining pages are still ahead; re-register on
+                        // the NEXT page of the chain if we know it.
+                        if !chain_ok {
+                            // We broke because current page not in ring;
+                            // re-add this chain to waiting for that page.
+                            waiting.entry(current).or_default().push(i);
+                        } else {
+                            // chain exhausted pages but remaining > 0:
+                            // chain broken; mark unresolved forever.
+                            assembled[i] = None;
                         }
                     }
                 }
@@ -591,6 +768,11 @@ fn main() {
             t0.elapsed().as_secs()
         );
     }
+
+    // Delete the gzip NOW to reclaim 46 GB before the join phase.
+    std::fs::remove_file(gz_path).ok();
+    std::fs::remove_file(pending_spill_path).ok();
+    eprintln!("gzip and pending spill deleted");
 
     // --- join and write rooms ---
     eprintln!("writing rooms...");
