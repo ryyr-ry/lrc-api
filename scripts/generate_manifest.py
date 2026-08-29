@@ -116,8 +116,8 @@ class RoomWriter:
 
 def decode_tracks_record(payload, header_length, encoding, tracks_col_names):
     """Decode only needed columns from a tracks record.
-    Needed: name(1), artist_name(2), album_name(3), duration(7), last_lyrics_id(8)
-    Skip: id(0, IPK), name_lower(4), artist_name_lower(5), album_name_lower(6), created_at(9), updated_at(10)
+    Column positions are resolved dynamically from the schema
+    because ALTER TABLE migrations append columns at the end.
     """
     h_off = 0
     header_len, hvsz = decode_varint_inline(payload, h_off)
@@ -129,6 +129,11 @@ def decode_tracks_record(payload, header_length, encoding, tracks_col_names):
         serial_types.append(st)
         h_off += stvsz
 
+    needed_idx = {}
+    for idx, col in enumerate(tracks_col_names):
+        if col in ("name", "artist_name", "album_name", "duration", "last_lyrics_id"):
+            needed_idx[idx] = col
+
     name = None
     artist = None
     album = None
@@ -138,15 +143,13 @@ def decode_tracks_record(payload, header_length, encoding, tracks_col_names):
     body_off = header_length
     ncols = len(serial_types)
 
-    needed = {1: "name", 2: "artist_name", 3: "album_name", 7: "duration", 8: "last_lyrics_id"}
-
     for ci in range(ncols):
         st = serial_types[ci]
         sz = serial_type_size(st)
 
-        if ci in needed:
+        if ci in needed_idx:
             val, body_off = decode_serial_value(payload, body_off, st, encoding)
-            col = needed[ci]
+            col = needed_idx[ci]
             if val is not None:
                 if col == "name":
                     name = val
@@ -173,8 +176,7 @@ def decode_tracks_record(payload, header_length, encoding, tracks_col_names):
 
 def decode_lyrics_record(payload, header_length, encoding, lyrics_col_names):
     """Decode only needed columns from a lyrics record.
-    Needed: plain_lyrics(1), synced_lyrics(2), lyricsfile(3), instrumental(8)
-    Skip: id(0, IPK), track_id(4), has_plain_lyrics(5), has_synced_lyrics(6), has_lyricsfile(7), source(9), created_at(10), updated_at(11)
+    Column positions are resolved dynamically from the schema.
     """
     h_off = 0
     header_len, hvsz = decode_varint_inline(payload, h_off)
@@ -186,6 +188,11 @@ def decode_lyrics_record(payload, header_length, encoding, lyrics_col_names):
         serial_types.append(st)
         h_off += stvsz
 
+    needed_idx = {}
+    for idx, col in enumerate(lyrics_col_names):
+        if col in ("plain_lyrics", "synced_lyrics", "lyricsfile", "instrumental"):
+            needed_idx[idx] = col
+
     plain = None
     synced = None
     lfile = None
@@ -194,15 +201,13 @@ def decode_lyrics_record(payload, header_length, encoding, lyrics_col_names):
     body_off = header_length
     ncols = len(serial_types)
 
-    needed = {1: "plain_lyrics", 2: "synced_lyrics", 3: "lyricsfile", 8: "instrumental"}
-
     for ci in range(ncols):
         st = serial_types[ci]
         sz = serial_type_size(st)
 
-        if ci in needed:
+        if ci in needed_idx:
             val, body_off = decode_serial_value(payload, body_off, st, encoding)
-            col = needed[ci]
+            col = needed_idx[ci]
             if val is not None:
                 if col == "plain_lyrics":
                     plain = val

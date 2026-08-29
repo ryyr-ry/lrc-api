@@ -12,6 +12,7 @@ on:
 
 env:
   DUMP_LIST_URL: https://lrclib-db-dumps.bu3nnyut4y9jfkdg.workers.dev/
+  DUMP_BASE_URL: https://db-dumps.lrclib.net/
   GZIP_PATH: /tmp/lrclib-db.sqlite3.gz
   MANIFEST_PATH: /tmp/manifest.json
   CHUNK_DIR: /tmp/rooms
@@ -36,7 +37,7 @@ jobs:
           set -euo pipefail
           LIST=$(curl -sS "$DUMP_LIST_URL")
           KEY=$(echo "$LIST" | python3 -c "import json,sys; print(json.load(sys.stdin)['objects'][0]['key'])")
-          URL="${DUMP_LIST_URL}${KEY}"
+          URL="${DUMP_BASE_URL}${KEY}"
           echo "dump_key=$KEY" >> "$GITHUB_OUTPUT"
           echo "dump_url=$URL" >> "$GITHUB_OUTPUT"
           echo "Latest dump: $KEY"
