@@ -36,15 +36,15 @@ jobs:
         run: |
           set -euo pipefail
           LIST=$(curl -sS "$DUMP_LIST_URL")
-          KEY=$(echo "$LIST" | python3 -c "
-import json, sys
-objs = json.load(sys.stdin)['objects']
-if not objs:
-    raise SystemExit('no dump objects')
-# pick the most recently uploaded dump, not just the first
-latest = max(objs, key=lambda o: o.get('uploaded', ''))
-print(latest['key'])
-")
+          KEY=$(echo "$LIST" | python3 << 'PYEOF'
+          import json, sys
+          objs = json.load(sys.stdin)['objects']
+          if not objs:
+              raise SystemExit('no dump objects')
+          latest = max(objs, key=lambda o: o.get('uploaded', ''))
+          print(latest['key'])
+          PYEOF
+          )
           URL="${DUMP_BASE_URL}${KEY}"
           echo "dump_key=$KEY" >> "$GITHUB_OUTPUT"
           echo "dump_url=$URL" >> "$GITHUB_OUTPUT"
