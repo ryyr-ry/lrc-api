@@ -35,29 +35,41 @@ jobs:
         id: detect
         run: |
           set -euo pipefail
-          LIST=$(curl -sS --retry 3 --retry-delay 3 --connect-timeout 20 "$DUMP_LIST_URL" || echo "")
-          if [ -z "$LIST" ]; then
-            echo "::error::Failed to fetch dump list from $DUMP_LIST_URL"
+          RESPONSE=$(curl -sS --retry 5 --retry-delay 5 --retry-all-errors --connect-timeout 30 -w "\nHTTP:%{http_code}" "$DUMP_LIST_URL" || echo "CURL_FAILED")
+          HTTP_CODE=$(printf '%s' "$RESPONSE" | grep -o 'HTTP:[0-9]*$' | cut -d: -f2)
+          LIST=$(printf '%s' "$RESPONSE" | grep -v 'HTTP:[0-9]*$' || true)
+          echo "HTTP status: ${HTTP_CODE:-none}"
+          if [ "${HTTP_CODE:-}" != "200" ] || [ -z "${LIST:-}" ]; then
+            echo "::error::Failed to fetch dump list from $DUMP_LIST_URL (status: ${HTTP_CODE:-none})"
             exit 1
           fi
-          KEY=$(echo "$LIST" | python3 << 'PYEOF'
-          import json, sys
-          objs = json.load(sys.stdin)['objects']
-          if not objs:
-              raise SystemExit('no dump objects')
-          latest = max(objs, key=lambda o: o.get('uploaded', ''))
-          print(latest['key'])
-          PYEOF
-          )
+          KEY=$(printf '%s' "$LIST" | jq -r '.objects | map(select(.key != null)) | sort_by(.uploaded) | last | .key')
+          if [ -z "${KEY:-}" ] || [ "$KEY" = "null" ]; then
+            echo "::error::No dump objects found"
+            exit 1
+          fi
           URL="${DUMP_BASE_URL}${KEY}"
           echo "dump_key=$KEY" >> "$GITHUB_OUTPUT"
           echo "dump_url=$URL" >> "$GITHUB_OUTPUT"
           echo "Latest dump: $KEY"
           PREV=""
           if curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/manifest.json" -o /tmp/prev_manifest.json 2>/dev/null; then
-            if python3 -c "import json; json.load(open('/tmp/prev_manifest.json'))" 2>/dev/null; then
-              PREV=$(python3 -c "import json; print(json.load(open('/tmp/prev_manifest.json')).get('dump_key',''))" 2>/dev/null || true)
-            fi
+            PREV=$(jq -r '.dump_key // empty' /tmp/prev_manifest.json 2>/dev/null || true)
+          fi
+          echo "Previous dump: ${PREV:-none}"
+          FORCE="${{ github.event.inputs.force }}"
+          if [ -z "${PREV:-}" ] || [ "$KEY" != "$PREV" ] || [ "$FORCE" = "true" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+          URL="${DUMP_BASE_URL}${KEY}"
+          echo "dump_key=$KEY" >> "$GITHUB_OUTPUT"
+          echo "dump_url=$URL" >> "$GITHUB_OUTPUT"
+          echo "Latest dump: $KEY"
+          PREV=""
+          if curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/manifest.json" -o /tmp/prev_manifest.json 2>/dev/null; then
+            PREV=$(jq -r '.dump_key // empty' /tmp/prev_manifest.json 2>/dev/null || true)
           fi
           echo "Previous dump: ${PREV:-none}"
           FORCE="${{ github.event.inputs.force }}"
@@ -110,6 +122,11 @@ jobs:
           sudo rm -rf /var/lib/postgresql || true
           sudo rm -rf /usr/local/julia* || true
           sudo rm -rf /imagegeneration || true
+          sudo rm -rf /usr/local/python || true
+          sudo rm -rf /opt/hostedtoolcache/Python || true
+          sudo rm -rf /usr/lib/python3 || true
+          sudo rm -rf /usr/lib/python3.12 || true
+          sudo rm -rf /usr/lib/pypy3 || true
           sudo apt-get purge -y --auto-remove azure-cli google-chrome-stable firefox microsoft-edge-stable 2>/dev/null || true
           sudo docker image prune -af 2>/dev/null || true
           df -h /tmp
@@ -145,66 +162,64 @@ jobs:
         run: |
           set -euo pipefail
 
-          python3 - "$CHUNK_DIR" "$MANIFEST_PATH" << 'EOF'
-          import json, os, subprocess, sys
-          chunk_dir = sys.argv[1]
-          manifest_path = sys.argv[2]
-          manifest = json.load(open(manifest_path))
-          rooms_per_release = manifest["rooms_per_release"]
-          release_tags = manifest["release_tags"]
-          files = manifest["files"]
+          ROOMS_PER_RELEASE=$(jq -r '.rooms_per_release' "$MANIFEST_PATH")
+          DUMP_KEY=$(jq -r '.dump_key' "$MANIFEST_PATH")
+          TAGS=$(jq -r '.release_tags[]' "$MANIFEST_PATH")
 
-          room_files = [f for f in files if f["name"].startswith("room-")]
-          index_files = [f for f in files if f["name"].startswith("index-")]
+          cd "$CHUNK_DIR"
 
-          groups = {}
-          for f in room_files:
-              rid = int(f["name"].split("-")[1].split(".")[0])
-              ri = rid // rooms_per_release
-              groups.setdefault(ri, []).append(f["name"])
-
-          repo = os.environ["GITHUB_REPOSITORY"]
-
-          def create_release(tag, title, notes):
-              subprocess.run(
-                  ["gh", "release", "delete", tag, "--yes", "--cleanup-tag"],
-                  check=False)
-              subprocess.run(
-                  ["gh", "release", "create", tag, "--repo", repo,
-                   "--title", title, "--notes", notes, "--prerelease", "--draft"],
-                  check=True)
-
-          def upload(tag, asset_paths):
-              if not asset_paths:
-                  return
-              cmd = ["gh", "release", "upload", tag,
-                     "--repo", repo, "--clobber"] + asset_paths
-              subprocess.run(cmd, cwd=chunk_dir, check=True)
-
-          def publish(tag):
-              subprocess.run(
-                  ["gh", "release", "edit", tag, "--draft=false", "--repo", repo],
-                  check=True)
-
-          for ri in sorted(groups):
-              tag = release_tags[ri]
-              notes = f"Room group {ri} for {manifest['dump_key']}"
-              print(f"Release {tag}: {len(groups[ri])} rooms", flush=True)
-              create_release(tag, f"Room data group {ri} (auto)", notes)
-              upload(tag, groups[ri])
-              publish(tag)
+          # Group room files by release index (room id / rooms_per_release)
+          # and upload each group to its own release tag.
+          GROUP=-1
+          COUNT=0
+          GROUP_FILES=""
+          for f in $(ls room-*.json | sort); do
+            RID=$(( 10#$(printf '%s' "$f" | tr -dc '0-9') ))
+            RI=$((RID / ROOMS_PER_RELEASE))
+            if [ "$RI" != "$GROUP" ]; then
+              # flush previous group
+              if [ -n "$GROUP_FILES" ]; then
+                TAG=$(printf '%s\n' "$TAGS" | sed -n "$((GROUP + 1))p")
+                echo "Release $TAG: $COUNT rooms"
+                gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+                gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+                  --title "Room data group $GROUP (auto)" \
+                  --notes "Room group $GROUP for $DUMP_KEY" \
+                  --prerelease --draft
+                gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber $GROUP_FILES
+                gh release edit "$TAG" --draft=false --repo "$GITHUB_REPOSITORY"
+              fi
+              GROUP=$RI
+              COUNT=0
+              GROUP_FILES=""
+            fi
+            GROUP_FILES="$GROUP_FILES $f"
+            COUNT=$((COUNT + 1))
+          done
+          if [ -n "$GROUP_FILES" ]; then
+            TAG=$(printf '%s\n' "$TAGS" | sed -n "$((GROUP + 1))p")
+            echo "Release $TAG: $COUNT rooms"
+            gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "Room data group $GROUP (auto)" \
+              --notes "Room group $GROUP for $DUMP_KEY" \
+              --prerelease --draft
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber $GROUP_FILES
+            gh release edit "$TAG" --draft=false --repo "$GITHUB_REPOSITORY"
+          fi
 
           # index files go to the last release tag
-          last_tag = release_tags[-1]
-          print(f"Uploading {len(index_files)} index files to {last_tag}", flush=True)
-          upload(last_tag, [f["name"] for f in index_files])
-          EOF
+          LAST_TAG=$(printf '%s\n' "$TAGS" | tail -n 1)
+          echo "Uploading index files to $LAST_TAG"
+          gh release upload "$LAST_TAG" --repo "$GITHUB_REPOSITORY" --clobber index-*.bin
+
+          cd "$GITHUB_WORKSPACE"
 
           gh release delete "$RELEASE_TAG" --yes --cleanup-tag 2>/dev/null || true
           gh release create "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --title "Room manifest (auto)" \
-            --notes "Manifest for ${{ needs.detect.outputs.dump_key }}" \
+            --notes "Manifest for $DUMP_KEY" \
             --prerelease --draft
           gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber \
             "$MANIFEST_PATH" "src/config.ts"
