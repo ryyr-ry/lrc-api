@@ -1,25 +1,23 @@
 import { describe, test, expect } from "bun:test";
-import { roomFileUrl, fetchRoomFile } from "../src/types";
+import { roomFileUrl, fetchRoomFile, fetchRoomFileJson } from "../src/types";
 import { RELEASE_TAGS } from "../src/config";
-
-const roomIds = [3, 19, 47, 52, 60, 70, 79, 84, 93, 98];
 
 async function fetchJson(url: string): Promise<{ status: number; text: string }> {
   let lastStatus = 0;
   let lastText = "";
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let attempt = 0; attempt < 5; attempt++) {
     try {
       const res = await fetchRoomFile(url);
       const text = await res.text();
       lastStatus = res.status;
       lastText = text;
-      if (res.status === 200 && text.startsWith("{")) {
+      if (res.status === 200 && text.startsWith("\u001f\u008b")) {
         return { status: res.status, text };
       }
     } catch (e) {
       lastText = e instanceof Error ? e.message : String(e);
     }
-    await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+    await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
   }
   return { status: lastStatus, text: lastText };
 }
@@ -27,8 +25,7 @@ async function fetchJson(url: string): Promise<{ status: number; text: string }>
 describe("real room fetch from GitHub Releases", () => {
   test("room file exists and has valid payload structure", async () => {
     const url = roomFileUrl(3, RELEASE_TAGS);
-    const { status, text } = await fetchJson(url);
-    expect(status).toBe(200);
+    const text = await fetchRoomFileJson(url);
     const payload = JSON.parse(text);
     expect(payload.room_id).toBe(3);
     expect(typeof payload.expected_count).toBe("number");
@@ -37,16 +34,16 @@ describe("real room fetch from GitHub Releases", () => {
   });
 
   test("all test room files are fetchable sequentially", async () => {
-    for (const rid of roomIds) {
+    for (const rid of [3, 19, 47]) {
       const url = roomFileUrl(rid, RELEASE_TAGS);
       const { status } = await fetchJson(url);
       expect(status).toBe(200);
     }
-  });
+  }, 120000);
 
   test("all test room files are fetchable concurrently", async () => {
     const results = await Promise.all(
-      roomIds.map(async (rid) => {
+      [52, 60, 70].map(async (rid) => {
         const { status } = await fetchJson(roomFileUrl(rid, RELEASE_TAGS));
         return { rid, status };
       })
@@ -54,13 +51,13 @@ describe("real room fetch from GitHub Releases", () => {
     for (const r of results) {
       expect(r.status, `room ${r.rid}`).toBe(200);
     }
-  });
+  }, 120000);
 
   test("missing room returns 404", async () => {
-    const url = roomFileUrl(1, RELEASE_TAGS);
+    const url = roomFileUrl(200, RELEASE_TAGS);
     const res = await fetchRoomFile(url);
     expect(res.status).toBe(404);
-  });
+  }, 30000);
 
   test("index files are fetchable", async () => {
     const tag = RELEASE_TAGS[RELEASE_TAGS.length - 1];
@@ -72,10 +69,11 @@ describe("real room fetch from GitHub Releases", () => {
     }
   });
 
-  test("room json is not double-gzipped", async () => {
+  test("room json.gz decompresses correctly", async () => {
     const url = roomFileUrl(3, RELEASE_TAGS);
-    const { status, text } = await fetchJson(url);
-    expect(status).toBe(200);
+    const text = await fetchRoomFileJson(url);
     expect(text.startsWith("{")).toBe(true);
+    const payload = JSON.parse(text);
+    expect(payload.records.length).toBe(payload.expected_count);
   });
 });

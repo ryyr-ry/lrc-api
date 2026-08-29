@@ -1,9 +1,9 @@
 //! Room file writer: per-room records stream to `.recs` files during
-//! the join; finalize() concatenates header + recs + tail into the
-//! final `.json` and deletes the `.recs` immediately. At most one room
-//! is doubled on disk at any time.
+//! the join; finalize() concatenates header + recs + tail and gzip
+//! compresses the result into `.json.gz`. Each `.recs` is deleted
+//! immediately after its room is finalized.
 //!
-//! Final room file format (identical to the Python generator):
+//! Final room file format (identical to the Python generator, gzipped):
 //! {
 //!   "room_id": N,
 //!   "dump_key": "...",
@@ -11,6 +11,8 @@
 //!   "records": [ ... ]
 //! }
 
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Write};
@@ -125,38 +127,38 @@ impl RoomWriter {
             let state = self.rooms.get_mut(&room_id).unwrap();
 
             let recs_path = format!("{}/room-{:04}.recs", self.dir, room_id);
-            let json_path = format!("{}/room-{:04}.json", self.dir, room_id);
+            let json_path = format!("{}/room-{:04}.json.gz", self.dir, room_id);
 
-            let mut out = BufWriter::new(
-                File::create(&json_path).expect("create room json"),
-            );
-            let header = format!(
-                "{{\"room_id\":{},\"dump_key\":{},\"expected_count\":{},\"records\":[",
-                room_id,
-                json_string(&self.dump_key),
-                state.count
-            );
-            out.write_all(header.as_bytes()).expect("write header");
+            {
+                let out_file = File::create(&json_path).expect("create room json.gz");
+                let mut enc = GzEncoder::new(out_file, Compression::default());
+                let header = format!(
+                    "{{\"room_id\":{},\"dump_key\":{},\"expected_count\":{},\"records\":[",
+                    room_id,
+                    json_string(&self.dump_key),
+                    state.count
+                );
+                enc.write_all(header.as_bytes()).expect("write header");
 
-            // Copy recs into the final file.
-            let mut recs = File::open(&recs_path).expect("open recs");
-            let mut chunk = vec![0u8; 1 << 20];
-            loop {
-                let n = recs.read(&mut chunk).expect("read recs");
-                if n == 0 {
-                    break;
+                // Copy recs into the final file.
+                let mut recs = File::open(&recs_path).expect("open recs");
+                let mut chunk = vec![0u8; 1 << 20];
+                loop {
+                    let n = recs.read(&mut chunk).expect("read recs");
+                    if n == 0 {
+                        break;
+                    }
+                    enc.write_all(&chunk[..n]).expect("copy recs");
                 }
-                out.write_all(&chunk[..n]).expect("copy recs");
+                enc.write_all(b"]}").expect("write tail");
+                enc.finish().expect("finish gz");
+                drop(recs);
             }
-            out.write_all(b"]}").expect("write tail");
-            out.flush().expect("flush room json");
-            drop(out);
-            drop(recs);
             std::fs::remove_file(&recs_path).ok();
 
             let size = std::fs::metadata(&json_path).map(|m| m.len()).unwrap_or(0);
             infos.push(RoomFileInfo {
-                name: format!("room-{:04}.json", room_id),
+                name: format!("room-{:04}.json.gz", room_id),
                 size,
                 record_count: state.count,
                 room_id,

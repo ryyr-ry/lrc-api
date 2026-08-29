@@ -13,7 +13,7 @@ rust_backend = ["flate2/rust_backend"]
 zlib-ng = ["flate2/zlib-ng"]
 
 [dependencies]
-flate2 = { version = "1", default-features = false }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 rayon = "1"
 unicode-normalization = "0.1"
 memmap2 = "0.9"

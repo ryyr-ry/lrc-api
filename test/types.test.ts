@@ -89,21 +89,21 @@ describe("roomFileUrl", () => {
   const tags = ["rooms-x-r0", "rooms-x-r1", "rooms-x-r2", "rooms-x-r3"];
   test("computes release index from room id deterministically", () => {
     expect(roomFileUrl(0, tags)).toBe(
-      "https://github.com/ryyr-ry/lrc-api/releases/download/rooms-x-r0/room-0000.json"
+      "https://github.com/ryyr-ry/lrc-api/releases/download/rooms-x-r0/room-0000.json.gz"
     );
     expect(roomFileUrl(899, tags)).toBe(
-      "https://github.com/ryyr-ry/lrc-api/releases/download/rooms-x-r0/room-0899.json"
+      "https://github.com/ryyr-ry/lrc-api/releases/download/rooms-x-r0/room-0899.json.gz"
     );
     expect(roomFileUrl(900, tags)).toBe(
-      "https://github.com/ryyr-ry/lrc-api/releases/download/rooms-x-r1/room-0900.json"
+      "https://github.com/ryyr-ry/lrc-api/releases/download/rooms-x-r1/room-0900.json.gz"
     );
     expect(roomFileUrl(3199, tags)).toBe(
-      "https://github.com/ryyr-ry/lrc-api/releases/download/rooms-x-r3/room-3199.json"
+      "https://github.com/ryyr-ry/lrc-api/releases/download/rooms-x-r3/room-3199.json.gz"
     );
   });
   test("pads room id to 4 digits", () => {
     expect(roomFileUrl(7, tags)).toBe(
-      "https://github.com/ryyr-ry/lrc-api/releases/download/rooms-x-r0/room-0007.json"
+      "https://github.com/ryyr-ry/lrc-api/releases/download/rooms-x-r0/room-0007.json.gz"
     );
   });
   test("throws for room id beyond release tags", () => {

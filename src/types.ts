@@ -71,7 +71,7 @@ export function roomFileUrl(roomId: number, releaseTags: string[]): string {
   if (!tag) {
     throw new Error(`no release tag for room ${roomId} (releaseIndex ${releaseIndex})`);
   }
-  return `${RELEASE_BASE_URL}/${tag}/room-${String(roomId).padStart(4, "0")}.json`;
+  return `${RELEASE_BASE_URL}/${tag}/room-${String(roomId).padStart(4, "0")}.json.gz`;
 }
 
 export async function fetchRoomFile(url: string): Promise<Response> {
@@ -83,6 +83,16 @@ export async function fetchRoomFile(url: string): Promise<Response> {
     }
   }
   return first;
+}
+
+export async function fetchRoomFileJson(url: string): Promise<string> {
+  const res = await fetchRoomFile(url);
+  if (!res.ok || !res.body) {
+    throw new Error(`fetch ${url} -> ${res.status}`);
+  }
+  const stream = res.body.pipeThrough(new DecompressionStream("gzip"));
+  const text = await new Response(stream).text();
+  return text;
 }
 
 export interface RoomFilePayload {

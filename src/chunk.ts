@@ -5,7 +5,7 @@ import {
   DEFAULT_SEARCH_LIMIT,
   MAX_SEARCH_LIMIT,
   roomFileUrl,
-  fetchRoomFile,
+  fetchRoomFileJson,
 } from "./types";
 import { RELEASE_TAGS, LOAD_MAX_ATTEMPTS, LOAD_RETRY_BASE_DELAY_MS } from "./config";
 import type { Request as PartyRequest, Room, Server, Connection } from "partykit/server";
@@ -80,12 +80,7 @@ export default class ChunkServer implements Server {
     for (let attempt = 0; attempt < LOAD_MAX_ATTEMPTS; attempt++) {
       try {
         const fileUrl = roomFileUrl(this.roomId, RELEASE_TAGS);
-        const res = await fetchRoomFile(fileUrl);
-        if (!res.ok) {
-          this.lastError = `fetch ${fileUrl} -> ${res.status}`;
-          throw new Error(this.lastError);
-        }
-        const text = await res.text();
+        const text = await fetchRoomFileJson(fileUrl);
         let payload: RoomFilePayload;
         try {
           payload = JSON.parse(text) as RoomFilePayload;
