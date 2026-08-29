@@ -2,6 +2,8 @@ import { describe, test, expect } from "bun:test";
 import { roomFileUrl, fetchRoomFile } from "../src/types";
 import { RELEASE_TAGS } from "../src/config";
 
+const roomIds = [3, 19, 47, 52, 60, 70, 79, 84, 93, 98];
+
 async function fetchJson(url: string): Promise<{ status: number; text: string }> {
   let lastStatus = 0;
   let lastText = "";
@@ -24,18 +26,17 @@ async function fetchJson(url: string): Promise<{ status: number; text: string }>
 
 describe("real room fetch from GitHub Releases", () => {
   test("room file exists and has valid payload structure", async () => {
-    const url = roomFileUrl(11, RELEASE_TAGS);
+    const url = roomFileUrl(3, RELEASE_TAGS);
     const { status, text } = await fetchJson(url);
     expect(status).toBe(200);
     const payload = JSON.parse(text);
-    expect(payload.room_id).toBe(11);
+    expect(payload.room_id).toBe(3);
     expect(typeof payload.expected_count).toBe("number");
     expect(Array.isArray(payload.records)).toBe(true);
     expect(payload.records.length).toBe(payload.expected_count);
   });
 
   test("all test room files are fetchable sequentially", async () => {
-    const roomIds = [11, 15, 23, 25, 35, 43, 75, 87];
     for (const rid of roomIds) {
       const url = roomFileUrl(rid, RELEASE_TAGS);
       const { status } = await fetchJson(url);
@@ -44,7 +45,6 @@ describe("real room fetch from GitHub Releases", () => {
   });
 
   test("all test room files are fetchable concurrently", async () => {
-    const roomIds = [11, 15, 23, 25, 35, 43, 75, 87];
     const results = await Promise.all(
       roomIds.map(async (rid) => {
         const { status } = await fetchJson(roomFileUrl(rid, RELEASE_TAGS));
@@ -57,7 +57,7 @@ describe("real room fetch from GitHub Releases", () => {
   });
 
   test("missing room returns 404", async () => {
-    const url = roomFileUrl(99, RELEASE_TAGS);
+    const url = roomFileUrl(1, RELEASE_TAGS);
     const res = await fetchRoomFile(url);
     expect(res.status).toBe(404);
   });
@@ -73,7 +73,7 @@ describe("real room fetch from GitHub Releases", () => {
   });
 
   test("room json is not double-gzipped", async () => {
-    const url = roomFileUrl(11, RELEASE_TAGS);
+    const url = roomFileUrl(3, RELEASE_TAGS);
     const { status, text } = await fetchJson(url);
     expect(status).toBe(200);
     expect(text.startsWith("{")).toBe(true);
