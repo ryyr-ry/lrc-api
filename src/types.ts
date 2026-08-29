@@ -57,14 +57,12 @@ export function generationEndTimeMs(unixTimeMs: number): number {
 
 export function generationPhase(
   unixTimeMs: number,
-  warmNextFraction: number,
-  routeSwitchFraction: number
-): "stable" | "warming-next" | "routing-next" {
+  warmNextFraction: number
+): "stable" | "warming-next" {
   const start = generationStartTimeMs(unixTimeMs);
   const elapsed = unixTimeMs - start;
   if (elapsed < GENERATION_MS * warmNextFraction) return "stable";
-  if (elapsed < GENERATION_MS * routeSwitchFraction) return "warming-next";
-  return "routing-next";
+  return "warming-next";
 }
 
 export function roomFileUrl(roomId: number, releaseTags: string[]): string {

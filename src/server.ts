@@ -13,7 +13,6 @@ import {
   NUM_SUBS,
   NUM_AGGREGATORS,
   WARM_NEXT_FRACTION,
-  ROUTE_SWITCH_FRACTION,
   VERSION,
   WARM_CRON_NAME,
 } from "./config";
@@ -234,7 +233,7 @@ async function handleApiSearch(
     }
   }
 
-  if (env.errors > 0 && env.results.length === 0) {
+  if (env.errors > 0) {
     return errorResponse(503, "NotReady", "Search rooms not ready");
   }
 
@@ -269,7 +268,7 @@ async function handleApiSearchLyrics(
     }
   }
 
-  if (env.errors > 0 && env.results.length === 0) {
+  if (env.errors > 0) {
     return errorResponse(503, "NotReady", "Search rooms not ready");
   }
 
@@ -387,7 +386,7 @@ export default {
     if (cron.name !== WARM_CRON_NAME) return;
     const now = Date.now();
     const gen = currentGeneration(now);
-    const phase = generationPhase(now, WARM_NEXT_FRACTION, ROUTE_SWITCH_FRACTION);
+    const phase = generationPhase(now, WARM_NEXT_FRACTION);
     const deadline = now + 50 * 1000;
 
     const minuteOfHour = new Date(now).getMinutes();

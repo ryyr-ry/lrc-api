@@ -69,19 +69,19 @@ describe("currentGeneration", () => {
 
 describe("generationPhase", () => {
   test("early in generation is stable", () => {
-    expect(generationPhase(0, 0.833, 0.917)).toBe("stable");
+    expect(generationPhase(0, 0.833)).toBe("stable");
   });
   test("middle of generation is stable", () => {
-    expect(generationPhase(GENERATION_MS * 0.5, 0.833, 0.917)).toBe("stable");
+    expect(generationPhase(GENERATION_MS * 0.5, 0.833)).toBe("stable");
   });
   test("after warm-next fraction is warming-next", () => {
-    expect(generationPhase(GENERATION_MS * 0.85, 0.833, 0.917)).toBe("warming-next");
+    expect(generationPhase(GENERATION_MS * 0.85, 0.833)).toBe("warming-next");
   });
-  test("after route-switch fraction is routing-next", () => {
-    expect(generationPhase(GENERATION_MS * 0.95, 0.833, 0.917)).toBe("routing-next");
+  test("near the end of generation is warming-next", () => {
+    expect(generationPhase(GENERATION_MS * 0.99, 0.833)).toBe("warming-next");
   });
   test("exactly at warm-next boundary is warming-next", () => {
-    expect(generationPhase(GENERATION_MS * 0.833, 0.833, 0.917)).toBe("warming-next");
+    expect(generationPhase(GENERATION_MS * 0.833, 0.833)).toBe("warming-next");
   });
 });
 

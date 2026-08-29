@@ -922,7 +922,6 @@ def main():
         f.write(f"export const GENERATION_HOURS = 3;\n")
         f.write(f"export const NUM_GENERATIONS = 8;\n")
         f.write(f"export const WARM_NEXT_FRACTION = 0.833;\n")
-        f.write(f"export const ROUTE_SWITCH_FRACTION = 0.917;\n")
         f.write(f"export const LOAD_MAX_ATTEMPTS = 5;\n")
         f.write(f"export const LOAD_RETRY_BASE_DELAY_MS = 2000;\n")
         f.write(f'export const VERSION = "0.2.0";\n')

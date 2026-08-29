@@ -8,7 +8,6 @@ export const RELEASE_TAGS = [
 export const GENERATION_HOURS = 3;
 export const NUM_GENERATIONS = 8;
 export const WARM_NEXT_FRACTION = 0.833;
-export const ROUTE_SWITCH_FRACTION = 0.917;
 export const LOAD_MAX_ATTEMPTS = 5;
 export const LOAD_RETRY_BASE_DELAY_MS = 2000;
 export const VERSION = "0.2.0";
