@@ -142,10 +142,6 @@ jobs:
           cd rust-parser
           cargo build --release --features zlib-ng
 
-      - name: Install Python dependencies
-        run: |
-          pip install --no-cache-dir rapidgzip orjson zstandard
-
       - name: Download DB dump
         run: |
           aria2c -x 16 -s 16 -d /tmp -o lrclib-db.sqlite3.gz "${{ needs.detect.outputs.dump_url }}"
