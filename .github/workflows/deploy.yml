@@ -41,7 +41,10 @@ jobs:
           echo "dump_key=$KEY" >> "$GITHUB_OUTPUT"
           echo "dump_url=$URL" >> "$GITHUB_OUTPUT"
           echo "Latest dump: $KEY"
-          PREV=$(curl -sS -L "https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/manifest.json" 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get('dump_key',''))" || echo "")
+          PREV=""
+          if curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/manifest.json" -o /tmp/prev_manifest.json 2>/dev/null; then
+            PREV=$(python3 -c "import json; print(json.load(open('/tmp/prev_manifest.json')).get('dump_key',''))" 2>/dev/null || echo "")
+          fi
           echo "Previous dump: ${PREV:-none}"
           if [ "$KEY" != "$PREV" ] || [ "${{ github.event.inputs.force }}" = "true" ]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
