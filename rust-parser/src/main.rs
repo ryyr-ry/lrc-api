@@ -32,7 +32,14 @@ use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 const KNOWN_TRACK_COUNT: u64 = 32_254_478;
 const KNOWN_LYRICS_COUNT: u64 = 32_680_034;
 const ROOM_TARGET_JSON_BYTES: u64 = 48 * 1024 * 1024;
-const RING_PAGES: usize = 65_536; // 256 MB at 4 KiB pages
+fn ring_pages() -> usize {
+    // Allows testing Pass 2 with a small ring: RING_PAGES env var.
+    std::env::var("RING_PAGES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(65_536)
+}
+
 const INDEX_PART_U16S: usize = (16 * 1024 * 1024) / 2;
 const LYRICS_TEMP: &str = "/tmp/lyrics_temp.zst";
 
@@ -471,7 +478,7 @@ fn main() {
     let mut lyrics_writer = BufWriter::with_capacity(1 << 20, lyrics_temp_file);
     let mut lyrics_temp_offset: u64 = 0;
 
-    let mut ring = sqlite::RingBuffer::new(RING_PAGES);
+    let mut ring = sqlite::RingBuffer::new(ring_pages());
     let mut pending: Vec<sqlite::PendingOverflow> = Vec::new();
     // Overflow local payloads spill to disk; only metadata stays in
     // memory (Python's pending_overflows.bin equivalent).
@@ -479,6 +486,7 @@ fn main() {
     let pending_spill_file =
         std::fs::File::create(pending_spill_path).expect("create pending spill");
     let mut pending_spill = BufWriter::with_capacity(1 << 20, pending_spill_file);
+    let mut pending_spill_offset: u64 = 0;
 
     // --- sequential scan ---
     eprintln!("scanning {} pages...", page_count);
@@ -571,9 +579,9 @@ fn main() {
             // Spill local payloads of new pending entries to disk and
             // drop them from memory.
             for p in pending.iter_mut().skip(new_pending_start) {
-                let off = pending_spill.stream_position().expect("spill pos");
-                p.spill_offset = off;
+                p.spill_offset = pending_spill_offset;
                 pending_spill.write_all(&p.local_payload).expect("spill payload");
+                pending_spill_offset += p.local_payload.len() as u64;
                 p.local_payload.clear();
                 p.local_payload.shrink_to_fit();
             }
@@ -613,6 +621,8 @@ fn main() {
     // buffer when possible, else reported unresolved.
     if !pending.is_empty() {
         eprintln!("pass 2: resolving {} pending overflows", pending.len());
+        pending_spill.flush().expect("flush pending spill");
+        drop(pending_spill);
         pending.sort_by_key(|p| p.ovfl_page);
 
         // chain state: (spill_offset, total_size, local_len, next_page, resolved)
@@ -629,7 +639,7 @@ fn main() {
             .map(|p| ChainState {
                 spill_offset: p.spill_offset,
                 total_size: p.total_payload_size,
-                local_len: p.local_payload.len(),
+                local_len: p.local_len,
                 next_page: p.ovfl_page,
                 rowid: p.rowid,
                 resolved: false,
@@ -658,6 +668,9 @@ fn main() {
         let mut header_prefix2 = [0u8; 100];
         gz2.read_exact(&mut header_prefix2).ok();
         let mut resolved = 0usize;
+        // Pass 2 keeps its own forward window; the pass-1 ring is left
+        // intact for chains whose pages sit behind the chain start.
+        let mut ring2 = sqlite::RingBuffer::new(ring_pages());
         let mut page = vec![0u8; page_size];
         for pn in 1..=page_count as u32 {
             if pn == 1 {
@@ -672,7 +685,7 @@ fn main() {
                     Err(_) => break,
                 }
             }
-            ring.put(pn, page.clone());
+            ring2.put(pn, page.clone());
 
             if let Some(idxs) = waiting.remove(&pn) {
                 for &i in &idxs {
@@ -692,13 +705,14 @@ fn main() {
                     let mut remaining = chains[i].total_size - buf.len();
                     let mut current = chains[i].next_page;
                     let mut chain_ok = true;
-                    let mut sweep = 0usize;
-                    while current != 0 && remaining > 0 && sweep < 8 {
-                        let data = match ring.get(current) {
+                    while current != 0 && remaining > 0 {
+                        let data = match ring.get(current)
+                            .or_else(|| ring2.get(current))
+                        {
                             Some(d) => d,
                             None => {
-                                // Not in ring: if this page is still
-                                // ahead, keep waiting.
+                                // Not in either ring: if this page is
+                                // still ahead in pass 2, keep waiting.
                                 chain_ok = false;
                                 break;
                             }
@@ -709,10 +723,10 @@ fn main() {
                         buf.extend_from_slice(&data[4..4 + take]);
                         remaining -= take;
                         current = next;
-                        sweep += 1;
                     }
-                    if chain_ok && remaining == 0 {
-                        // Fully assembled. Process the record.
+                    if remaining == 0 {
+                        // Fully assembled regardless of whether the
+                        // chain pointer ended at 0.
                         if process_assembled(
                             &buf,
                             chains[i].rowid,
@@ -744,18 +758,19 @@ fn main() {
                         }
                         assembled[i] = None;
                     } else {
-                        // Keep the buffer and wait for the next page.
-                        assembled[i] = Some(buf);
-                        // remaining pages are still ahead; re-register on
-                        // the NEXT page of the chain if we know it.
-                        if !chain_ok {
-                            // We broke because current page not in ring;
-                            // re-add this chain to waiting for that page.
+                        // Chain incomplete: either a needed page has not
+                        // been swept yet, or the chain is corrupt.
+                        if chain_ok && current == 0 {
+                            // Chain ended before payload complete: corrupt.
+                            assembled[i] = None;
+                            chains[i].resolved = true; // do not retry
+                        } else if !chain_ok && current != 0 {
+                            // The next page is still ahead; wait for it.
+                            assembled[i] = Some(buf);
                             waiting.entry(current).or_default().push(i);
                         } else {
-                            // chain exhausted pages but remaining > 0:
-                            // chain broken; mark unresolved forever.
                             assembled[i] = None;
+                            chains[i].resolved = true; // do not retry
                         }
                     }
                 }

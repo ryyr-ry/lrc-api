@@ -30,8 +30,9 @@ pub struct PendingOverflow {
     pub rowid: u64,
     pub ovfl_page: u32,
     pub total_payload_size: usize,
-    /// Offset of local_payload within the spill file (or payload itself
-    /// when kept inline during pass 1).
+    /// Length of the local payload stored in the spill file.
+    pub local_len: usize,
+    /// Offset of local_payload within the spill file.
     pub spill_offset: u64,
     pub local_payload: Vec<u8>,
     pub resolved: bool,
@@ -236,10 +237,12 @@ pub fn parse_leaf_table_cells(
                     cells.push(cell);
                 }
             } else {
+                let local_len = local_payload.len();
                 pending.push(PendingOverflow {
                     rowid,
                     ovfl_page,
                     total_payload_size: payload_size,
+                    local_len,
                     spill_offset: 0,
                     local_payload,
                     resolved: false,
