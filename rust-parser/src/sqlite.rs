@@ -87,6 +87,9 @@ pub enum SerialValue {
 
 pub fn decode_serial_value(data: &[u8], offset: usize, st: u64) -> (SerialValue, usize) {
     let sz = serial_type_size(st);
+    if offset.checked_add(sz).map_or(true, |end| end > data.len()) {
+        return (SerialValue::Null, offset);
+    }
     match st {
         0 => (SerialValue::Null, offset),
         8 => (SerialValue::Int(0), offset),
