@@ -1,0 +1,25 @@
+[package]
+name = "lrc-room-generator"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "lrc-room-generator"
+path = "src/main.rs"
+
+[dependencies]
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+rayon = "1"
+unicode-normalization = "0.1"
+memmap2 = "0.9"
+zstd = "0.13"
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+debug = false
+
+[profile.dev]
+opt-level = 1

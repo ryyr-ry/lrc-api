@@ -58,6 +58,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Verify disk space
+        run: df -h /tmp
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build generator
+        run: |
+          cd rust-parser
+          cargo build --release
+
       - name: Install Python dependencies
         run: |
           pip install --no-cache-dir rapidgzip orjson zstandard
@@ -65,10 +86,12 @@ jobs:
       - name: Download DB dump
         run: |
           aria2c -x 16 -s 16 -d /tmp -o lrclib-db.sqlite3.gz "${{ needs.detect.outputs.dump_url }}"
+          df -h /tmp
 
-      - name: Generate room files
+      - name: Generate room files (Rust)
         run: |
-          python scripts/generate_manifest.py "$GZIP_PATH" "$MANIFEST_PATH" "src/config.ts" "$CHUNK_DIR" "${{ needs.detect.outputs.dump_key }}"
+          ./rust-parser/target/release/lrc-room-generator "$GZIP_PATH" "$MANIFEST_PATH" "src/config.ts" "$CHUNK_DIR" "${{ needs.detect.outputs.dump_key }}"
+          df -h /tmp
 
       - name: Upload to Releases
         env:
