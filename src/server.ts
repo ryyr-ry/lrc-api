@@ -145,6 +145,9 @@ async function handleApiGetById(
   } catch {
     return errorResponse(503, "NotReady", "Index not ready");
   }
+  if (indexRpc.status === 400) {
+    return errorResponse(404, "TrackNotFound", "Failed to find specified track");
+  }
   if (indexRpc.status !== 200) {
     return errorResponse(503, "NotReady", "Index lookup failed");
   }
