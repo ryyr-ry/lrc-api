@@ -36,17 +36,28 @@ jobs:
         run: |
           set -euo pipefail
           LIST=$(curl -sS "$DUMP_LIST_URL")
-          KEY=$(echo "$LIST" | python3 -c "import json,sys; print(json.load(sys.stdin)['objects'][0]['key'])")
+          KEY=$(echo "$LIST" | python3 -c "
+import json, sys
+objs = json.load(sys.stdin)['objects']
+if not objs:
+    raise SystemExit('no dump objects')
+# pick the most recently uploaded dump, not just the first
+latest = max(objs, key=lambda o: o.get('uploaded', ''))
+print(latest['key'])
+")
           URL="${DUMP_BASE_URL}${KEY}"
           echo "dump_key=$KEY" >> "$GITHUB_OUTPUT"
           echo "dump_url=$URL" >> "$GITHUB_OUTPUT"
           echo "Latest dump: $KEY"
           PREV=""
           if curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/manifest.json" -o /tmp/prev_manifest.json 2>/dev/null; then
-            PREV=$(python3 -c "import json; print(json.load(open('/tmp/prev_manifest.json')).get('dump_key',''))" 2>/dev/null || echo "")
+            if python3 -c "import json; json.load(open('/tmp/prev_manifest.json'))" 2>/dev/null; then
+              PREV=$(python3 -c "import json; print(json.load(open('/tmp/prev_manifest.json')).get('dump_key',''))" 2>/dev/null || true)
+            fi
           fi
           echo "Previous dump: ${PREV:-none}"
-          if [ "$KEY" != "$PREV" ] || [ "${{ github.event.inputs.force }}" = "true" ]; then
+          FORCE="${{ github.event.inputs.force }}"
+          if [ -z "${PREV:-}" ] || [ "$KEY" != "$PREV" ] || [ "$FORCE" = "true" ]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"
