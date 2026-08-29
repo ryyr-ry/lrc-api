@@ -140,7 +140,7 @@ jobs:
       - name: Build generator
         run: |
           cd rust-parser
-          cargo build --release --features zlib-ng
+          cargo build --release --no-default-features --features zlib-ng
 
       - name: Download DB dump
         run: |

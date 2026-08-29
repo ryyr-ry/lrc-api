@@ -1,24 +1,4 @@
 //! LRCLIB room file generator (Rust).
-//!
-//! Replaces scripts/generate_manifest.py with a much faster
-//! implementation. Usage:
-//!
-//!   lrc-room-generator <db.gz> <manifest.json> <config.ts> <rooms-dir> <dump-key>
-//!
-//! Disk timeline (145 GB runner, ~127 GB free after cleanup):
-//!   T0: gzip 46 GB on disk
-//!   T1: scan: gzip 46 GB + lyrics zstd temp (grows to ~19 GB)
-//!   T2: scan done: gzip DELETED, lyrics temp ~19 GB
-//!   T3: join: lyrics temp 19 GB + room files (grow to ~88 GB) = 107 GB peak
-//!   T4: lyrics temp deleted, room files ~88 GB
-//!   T5: upload deletes each release group after upload
-//!
-//! Memory design (16 GB runner):
-//!   - track metadata (name/artist/album): ~1.3 GB total
-//!   - room indices, matched bitmap, linked lists: ~1 GB
-//!   - lyrics never held in memory: streamed to a zstd temp file during
-//!     the scan and read back sequentially during the join
-//!   - per-room buffers spill to part files at 32 MB
 
 mod partition;
 mod schema;
@@ -41,7 +21,98 @@ fn ring_pages() -> usize {
 }
 
 const INDEX_PART_U16S: usize = (16 * 1024 * 1024) / 2;
-const LYRICS_TEMP: &str = "/tmp/lyrics_temp.zst";
+const LYRICS_TEMP_PREFIX: &str = "/tmp/lyrics_temp";
+const LYRICS_CHUNK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Lyrics spill: independent zstd frames across 2GB chunk files.
+/// Each lyric record becomes an independent frame via a reused bulk
+/// compressor; its chunk number, offset within the chunk, and
+/// compressed length are recorded for sequential read-back.
+struct LyricsSpill {
+    current_chunk: u32,
+    current_written: u64,
+    file: Option<BufWriter<std::fs::File>>,
+}
+
+impl LyricsSpill {
+    fn new() -> Self {
+        // Remove stale chunks from previous runs so truncate/open
+        // always starts from a clean state.
+        let mut c = 0u32;
+        loop {
+            let p = Self::chunk_path(c);
+            if !std::path::Path::new(&p).exists() {
+                break;
+            }
+            std::fs::remove_file(&p).ok();
+            c += 1;
+            if c > 100_000 {
+                break;
+            }
+        }
+        LyricsSpill {
+            current_chunk: 0,
+            current_written: 0,
+            file: None,
+        }
+    }
+
+    fn chunk_path(chunk: u32) -> String {
+        format!("{}_{:03}.zst", LYRICS_TEMP_PREFIX, chunk)
+    }
+
+    fn rotate(&mut self) {
+        if let Some(f) = self.file.take() {
+            drop(f);
+        }
+        self.current_chunk += 1;
+        self.current_written = 0;
+    }
+
+    fn ensure_file(&mut self) {
+        if self.file.is_none() {
+            let path = Self::chunk_path(self.current_chunk);
+            let f = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&path)
+                .expect("create lyrics chunk");
+            self.file = Some(BufWriter::with_capacity(1 << 20, f));
+        }
+    }
+
+    /// Write one lyric record as an independent frame. Returns
+    /// (chunk, offset, compressed_len).
+    fn write_lyrics(&mut self, raw: &[u8]) -> (u32, u64, u64) {
+        self.ensure_file();
+        let compressed = zstd::bulk::compress(raw, 3).expect("compress lyrics");
+        let before = self.current_written;
+        let len = compressed.len() as u64;
+        self.file
+            .as_mut()
+            .unwrap()
+            .write_all(&compressed)
+            .expect("write lyrics frame");
+        self.current_written += len;
+        let chunk = self.current_chunk;
+        if self.current_written >= LYRICS_CHUNK_BYTES {
+            self.rotate();
+        }
+        (chunk, before, len)
+    }
+
+    fn finish(&mut self) {
+        if let Some(mut f) = self.file.take() {
+            let _ = f.flush();
+            drop(f);
+        }
+        // Always advance to a fresh chunk so later writes never append
+        // to frames already on disk.
+        self.current_chunk += 1;
+        self.current_written = 0;
+    }
+}
 
 #[derive(Debug)]
 struct TrackMeta {
@@ -281,10 +352,11 @@ fn process_assembled(
     matched: &mut Vec<u8>,
     lyrics_first: &mut Vec<u32>,
     null_ids: &mut Vec<u32>,
+    lyrics_chunk: &mut Vec<u32>,
     lyrics_offset: &mut Vec<u64>,
     lyrics_compressed_len: &mut Vec<u64>,
     lyrics_instrumental: &mut Vec<u8>,
-    lyrics_temp_offset: &mut u64,
+    lyrics_spill: &mut LyricsSpill,
     num_rooms: u32,
     tc: &mut u64,
     lc: &mut u64,
@@ -317,6 +389,7 @@ fn process_assembled(
             if l > *max_lid {
                 let new_len = l + 1;
                 lyrics_first.resize(new_len, 0);
+                lyrics_chunk.resize(new_len, 0);
                 lyrics_offset.resize(new_len, 0);
                 lyrics_compressed_len.resize(new_len, 0);
                 lyrics_instrumental.resize(new_len, 0);
@@ -334,6 +407,7 @@ fn process_assembled(
         if l > *max_lid {
             let new_len = l + 1;
             lyrics_first.resize(new_len, 0);
+            lyrics_chunk.resize(new_len, 0);
             lyrics_offset.resize(new_len, 0);
             lyrics_compressed_len.resize(new_len, 0);
             lyrics_instrumental.resize(new_len, 0);
@@ -342,16 +416,10 @@ fn process_assembled(
         let meta = decode_lyrics(&cell, lyrics_map);
         lyrics_instrumental[l] = if meta.instrumental { 1 } else { 0 };
         let raw = lyrics_to_bytes(&meta);
-        let compressed =
-            zstd::stream::encode_all(raw.as_slice(), 9).expect("compress lyrics");
-        lyrics_offset[l] = *lyrics_temp_offset;
-        lyrics_compressed_len[l] = compressed.len() as u64;
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(LYRICS_TEMP)
-            .expect("append lyrics temp");
-        f.write_all(&compressed).expect("append lyrics");
-        *lyrics_temp_offset += compressed.len() as u64;
+        let (chunk, off, len) = lyrics_spill.write_lyrics(&raw);
+        lyrics_chunk[l] = chunk;
+        lyrics_offset[l] = off;
+        lyrics_compressed_len[l] = len;
         *lc += 1;
         true
     } else {
@@ -434,6 +502,7 @@ fn main() {
     let mut next_track: Vec<u32> = vec![0; max_tid + 1];
     let mut lyrics_first: Vec<u32> = vec![0; max_lid + 1];
     let mut null_ids: Vec<u32> = Vec::new();
+    let mut lyrics_chunk: Vec<u32> = vec![0; max_lid + 1];
     let mut lyrics_offset: Vec<u64> = vec![0; max_lid + 1];
     let mut lyrics_compressed_len: Vec<u64> = vec![0; max_lid + 1];
     let mut lyrics_instrumental: Vec<u8> = vec![0; max_lid + 1];
@@ -462,6 +531,7 @@ fn main() {
             if l > max_lid {
                 let new_len = l + 1;
                 lyrics_first.resize(new_len, 0);
+                lyrics_chunk.resize(new_len, 0);
                 lyrics_offset.resize(new_len, 0);
                 lyrics_compressed_len.resize(new_len, 0);
                 lyrics_instrumental.resize(new_len, 0);
@@ -471,12 +541,7 @@ fn main() {
         }};
     }
 
-    // lyrics zstd spill: each record is an independent zstd frame written
-    // sequentially; lengths are recorded for the join phase read-back.
-    let lyrics_temp_file =
-        std::fs::File::create(LYRICS_TEMP).expect("create lyrics temp");
-    let mut lyrics_writer = BufWriter::with_capacity(1 << 20, lyrics_temp_file);
-    let mut lyrics_temp_offset: u64 = 0;
+    let mut lyrics_spill = LyricsSpill::new();
 
     let mut ring = sqlite::RingBuffer::new(ring_pages());
     let mut pending: Vec<sqlite::PendingOverflow> = Vec::new();
@@ -563,14 +628,10 @@ fn main() {
                     let meta = decode_lyrics(&cell, &lyrics_map);
                     lyrics_instrumental[lidx] = if meta.instrumental { 1 } else { 0 };
                     let raw = lyrics_to_bytes(&meta);
-                    let compressed = zstd::stream::encode_all(raw.as_slice(), 9)
-                        .expect("compress lyrics");
-                    lyrics_offset[lidx] = lyrics_temp_offset;
-                    lyrics_compressed_len[lidx] = compressed.len() as u64;
-                    lyrics_writer
-                        .write_all(&compressed)
-                        .expect("write lyrics temp");
-                    lyrics_temp_offset += compressed.len() as u64;
+                    let (chunk, off, len) = lyrics_spill.write_lyrics(&raw);
+                    lyrics_chunk[lidx] = chunk;
+                    lyrics_offset[lidx] = off;
+                    lyrics_compressed_len[lidx] = len;
                     lc += 1;
                 }
             }
@@ -610,9 +671,8 @@ fn main() {
         t0.elapsed().as_secs()
     );
 
-    lyrics_writer.flush().expect("flush lyrics temp");
-    drop(lyrics_writer);
-    eprintln!("lyrics temp: {} bytes", lyrics_temp_offset);
+    lyrics_spill.finish();
+    eprintln!("lyrics chunks written: {}", lyrics_spill.current_chunk);
 
     // --- Pass 2: resolve pending overflows with one sequential sweep ---
     // Chains are assembled via a waiting map: when a chain's page
@@ -745,10 +805,11 @@ fn main() {
                             &mut matched,
                             &mut lyrics_first,
                             &mut null_ids,
+                            &mut lyrics_chunk,
                             &mut lyrics_offset,
                             &mut lyrics_compressed_len,
                             &mut lyrics_instrumental,
-                            &mut lyrics_temp_offset,
+                            &mut lyrics_spill,
                             num_rooms,
                             &mut tc,
                             &mut lc,
@@ -784,6 +845,9 @@ fn main() {
         );
     }
 
+    // Flush any lyrics written during pass 2 before reading back.
+    lyrics_spill.finish();
+
     // Delete the gzip NOW to reclaim 46 GB before the join phase.
     std::fs::remove_file(gz_path).ok();
     std::fs::remove_file(pending_spill_path).ok();
@@ -810,47 +874,64 @@ fn main() {
     }
     eprintln!("null-lyrics written: {}", null_ids.len());
 
-    // Lyrics join: sequential read-back of the zstd temp file.
-    let lyrics_temp_reader = std::fs::File::open(LYRICS_TEMP).expect("open lyrics temp");
-    let mut lyrics_reader = BufReader::with_capacity(1 << 20, lyrics_temp_reader);
+    // Lyrics join: read back chunk by chunk in lid order. Each chunk is
+    // deleted as soon as every lid it holds has been processed, keeping
+    // the disk peak near the room-file total.
     let mut mc: u64 = 0;
-    for lid in 1..max_lid {
-        if lyrics_compressed_len[lid] == 0 {
+    let total_chunks = (lyrics_spill.current_chunk + 1) as usize;
+    for chunk in 0..total_chunks {
+        let chunk_path = LyricsSpill::chunk_path(chunk as u32);
+        if !std::path::Path::new(&chunk_path).exists() {
             continue;
         }
-        let off = lyrics_offset[lid];
-        let clen = lyrics_compressed_len[lid] as usize;
-        lyrics_reader.seek(SeekFrom::Start(off)).ok();
-        let mut compressed = vec![0u8; clen];
-        lyrics_reader.read_exact(&mut compressed).ok();
-        let raw = zstd::stream::decode_all(compressed.as_slice()).expect("decompress lyrics");
-        let ly = parse_lyrics_bytes(&raw);
-        let instrumental = lyrics_instrumental[lid] == 1;
-
-        let mut tid = lyrics_first[lid];
-        while tid != 0 {
-            let t = tid as usize;
-            if t <= max_tid && !track_names[t].is_empty() && matched[t] == 0 {
-                let meta = TrackMeta {
-                    name: track_names[t].clone(),
-                    artist: track_artists[t].clone(),
-                    album: track_albums[t].clone(),
-                    duration: track_durations[t],
-                    last_lid: Some(lid as u64),
-                };
-                let json = build_record_json(t as u64, &meta, Some(&LyricsMeta {
-                    plain: ly.0.clone(),
-                    synced: ly.1.clone(),
-                    lyricsfile: ly.2.clone(),
-                    instrumental,
-                }));
-                let ridx = room_indices[t];
-                room_writer.write_record(ridx, &json);
-                matched[t] = 1;
-                mc += 1;
+        let lyrics_temp_reader =
+            std::fs::File::open(&chunk_path).expect("open lyrics chunk");
+        let mut lyrics_reader = BufReader::with_capacity(1 << 20, lyrics_temp_reader);
+        for lid in 1..=max_lid {
+            if lyrics_chunk[lid] != chunk as u32 || lyrics_compressed_len[lid] == 0 {
+                continue;
             }
-            tid = next_track[t];
+            let off = lyrics_offset[lid];
+            let clen = lyrics_compressed_len[lid] as usize;
+            lyrics_reader
+                .seek(SeekFrom::Start(off))
+                .expect("seek lyrics frame");
+            let mut compressed = vec![0u8; clen];
+            lyrics_reader
+                .read_exact(&mut compressed)
+                .expect("read lyrics frame");
+            let raw = zstd::bulk::decompress(compressed.as_slice(), 1 << 20)
+                .expect("decompress lyrics frame");
+            let ly = parse_lyrics_bytes(&raw);
+            let instrumental = lyrics_instrumental[lid] == 1;
+
+            let mut tid = lyrics_first[lid];
+            while tid != 0 {
+                let t = tid as usize;
+                if t <= max_tid && !track_names[t].is_empty() && matched[t] == 0 {
+                    let meta = TrackMeta {
+                        name: track_names[t].clone(),
+                        artist: track_artists[t].clone(),
+                        album: track_albums[t].clone(),
+                        duration: track_durations[t],
+                        last_lid: Some(lid as u64),
+                    };
+                    let json = build_record_json(t as u64, &meta, Some(&LyricsMeta {
+                        plain: ly.0.clone(),
+                        synced: ly.1.clone(),
+                        lyricsfile: ly.2.clone(),
+                        instrumental,
+                    }));
+                    let ridx = room_indices[t];
+                    room_writer.write_record(ridx, &json);
+                    matched[t] = 1;
+                    mc += 1;
+                }
+                tid = next_track[t];
+            }
         }
+        drop(lyrics_reader);
+        std::fs::remove_file(&chunk_path).ok();
     }
 
     // Unmatched tracks.
@@ -878,8 +959,10 @@ fn main() {
         t0.elapsed().as_secs()
     );
 
-    // Delete the lyrics temp file after the join.
-    std::fs::remove_file(LYRICS_TEMP).ok();
+    // Delete any remaining lyrics chunks after the join.
+    for chunk in 0..=(lyrics_spill.current_chunk) {
+        std::fs::remove_file(LyricsSpill::chunk_path(chunk)).ok();
+    }
 
     let room_infos = room_writer.finalize();
     eprintln!("rooms written: {}", room_infos.len());
