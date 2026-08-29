@@ -1,7 +1,8 @@
-//! Room file writer: per-room records stream to `.recs` files during
-//! the join; finalize() concatenates header + recs + tail and gzip
-//! compresses the result into `.json.gz`. Each `.recs` is deleted
-//! immediately after its room is finalized.
+//! Room file writer: per-room records stream to gzip-compressed
+//! `.recs` files during the join (each spill is an independent gzip
+//! member). finalize() concatenates gzip(header) + recs members +
+//! gzip(tail) into `.json.gz`; gzip members concatenate into a valid
+//! single stream, so rooms can decompress the file in one pass.
 //!
 //! Final room file format (identical to the Python generator, gzipped):
 //! {
@@ -57,13 +58,15 @@ impl RoomWriter {
             return;
         }
         let path = format!("{}/room-{:04}.recs", dir, room_id);
-        let mut f = OpenOptions::new()
+        // Append one independent gzip member per spill.
+        let out_file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
             .expect("append recs file");
-        f.write_all(&state.buffer).expect("append recs");
-        f.flush().expect("flush recs");
+        let mut enc = GzEncoder::new(out_file, Compression::default());
+        enc.write_all(&state.buffer).expect("write recs member");
+        enc.finish().expect("finish recs member");
         self.total_buffered -= state.buffer.len();
         state.buffer.clear();
         state.buffer.shrink_to_fit();
@@ -109,7 +112,8 @@ impl RoomWriter {
         }
     }
 
-    /// Finalize all rooms: flush remaining buffers and close with `]}`.
+    /// Finalize all rooms into `.json.gz`: gzip(header) + recs members
+    /// + gzip(tail), then delete each `.recs`.
     pub fn finalize(&mut self) -> Vec<RoomFileInfo> {
         let mut infos = Vec::new();
         let room_ids: Vec<u32> = {
@@ -131,6 +135,8 @@ impl RoomWriter {
 
             {
                 let out_file = File::create(&json_path).expect("create room json.gz");
+
+                // gzip member 1: header
                 let mut enc = GzEncoder::new(out_file, Compression::default());
                 let header = format!(
                     "{{\"room_id\":{},\"dump_key\":{},\"expected_count\":{},\"records\":[",
@@ -139,8 +145,9 @@ impl RoomWriter {
                     state.count
                 );
                 enc.write_all(header.as_bytes()).expect("write header");
+                enc.finish().expect("finish header member");
 
-                // Copy recs into the final file.
+                // recs members are already valid gzip members; copy raw.
                 let mut recs = File::open(&recs_path).expect("open recs");
                 let mut chunk = vec![0u8; 1 << 20];
                 loop {
@@ -148,11 +155,25 @@ impl RoomWriter {
                     if n == 0 {
                         break;
                     }
-                    enc.write_all(&chunk[..n]).expect("copy recs");
+                    // Append after the header member; open the file in
+                    // append mode for this copy.
+                    let mut app = OpenOptions::new()
+                        .append(true)
+                        .open(&json_path)
+                        .expect("open json.gz for append");
+                    app.write_all(&chunk[..n]).expect("copy recs");
+                    app.flush().expect("flush copy");
                 }
-                enc.write_all(b"]}").expect("write tail");
-                enc.finish().expect("finish gz");
                 drop(recs);
+
+                // gzip member 3: tail
+                let mut app = OpenOptions::new()
+                    .append(true)
+                    .open(&json_path)
+                    .expect("open json.gz for tail");
+                let mut enc_tail = GzEncoder::new(app, Compression::default());
+                enc_tail.write_all(b"]}").expect("write tail");
+                enc_tail.finish().expect("finish tail member");
             }
             std::fs::remove_file(&recs_path).ok();
 
