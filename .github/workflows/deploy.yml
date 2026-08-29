@@ -169,7 +169,7 @@ jobs:
           GROUP=-1
           COUNT=0
           GROUP_FILES=""
-          for f in $(ls room-*.json | sort); do
+          for f in $(ls room-*.json.gz | sort); do
             RID=$(( 10#$(printf '%s' "$f" | tr -dc '0-9') ))
             RI=$((RID / ROOMS_PER_RELEASE))
             if [ "$RI" != "$GROUP" ]; then

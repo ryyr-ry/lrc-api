@@ -874,11 +874,19 @@ fn main() {
     }
     eprintln!("null-lyrics written: {}", null_ids.len());
 
-    // Lyrics join: read back chunk by chunk in lid order. Each chunk is
-    // deleted as soon as every lid it holds has been processed, keeping
-    // the disk peak near the room-file total.
+    // Lyrics join: read back chunk by chunk. Lids are bucketed by chunk
+    // once (O(max_lid)) instead of rescanning all lids per chunk.
     let mut mc: u64 = 0;
     let total_chunks = (lyrics_spill.current_chunk + 1) as usize;
+    let mut chunk_lids: Vec<Vec<u32>> = vec![Vec::new(); total_chunks.max(1)];
+    for lid in 1..=max_lid {
+        if lyrics_compressed_len[lid] > 0 {
+            let c = lyrics_chunk[lid] as usize;
+            if c < chunk_lids.len() {
+                chunk_lids[c].push(lid as u32);
+            }
+        }
+    }
     for chunk in 0..total_chunks {
         let chunk_path = LyricsSpill::chunk_path(chunk as u32);
         if !std::path::Path::new(&chunk_path).exists() {
@@ -887,7 +895,8 @@ fn main() {
         let lyrics_temp_reader =
             std::fs::File::open(&chunk_path).expect("open lyrics chunk");
         let mut lyrics_reader = BufReader::with_capacity(1 << 20, lyrics_temp_reader);
-        for lid in 1..=max_lid {
+        for &lid in &chunk_lids[chunk] {
+            let lid = lid as usize;
             if lyrics_chunk[lid] != chunk as u32 || lyrics_compressed_len[lid] == 0 {
                 continue;
             }
