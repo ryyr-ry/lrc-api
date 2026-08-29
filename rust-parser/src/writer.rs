@@ -1,5 +1,7 @@
-//! Room file writer: incremental per-room buffering with part-file
-//! spill. Never holds more than ~32MB per room in memory.
+//! Room file writer: per-room records stream to `.recs` files during
+//! the join; finalize() concatenates header + recs + tail into the
+//! final `.json` and deletes the `.recs` immediately. At most one room
+//! is doubled on disk at any time.
 //!
 //! Final room file format (identical to the Python generator):
 //! {
@@ -10,9 +12,8 @@
 //! }
 
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Read, Write};
 
 const ROOM_BUFFER_LIMIT: usize = 32 * 1024 * 1024;
 const GLOBAL_BUFFER_CAP: usize = 512 * 1024 * 1024;
@@ -30,7 +31,7 @@ pub struct RoomWriter {
 struct RoomState {
     buffer: Vec<u8>,
     count: u64,
-    part_idx: u32,
+    recs_open: bool,
 }
 
 impl RoomWriter {
@@ -47,6 +48,26 @@ impl RoomWriter {
         }
     }
 
+    fn flush_room_buffer(&mut self, room_id: u32) {
+        let dir = self.dir.clone();
+        let state = self.rooms.get_mut(&room_id).unwrap();
+        if state.buffer.is_empty() {
+            return;
+        }
+        let path = format!("{}/room-{:04}.recs", dir, room_id);
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("append recs file");
+        f.write_all(&state.buffer).expect("append recs");
+        f.flush().expect("flush recs");
+        self.total_buffered -= state.buffer.len();
+        state.buffer.clear();
+        state.buffer.shrink_to_fit();
+        state.recs_open = true;
+    }
+
     fn spill_largest(&mut self) {
         let mut largest_id = 0u32;
         let mut largest_len = 0usize;
@@ -59,16 +80,7 @@ impl RoomWriter {
         if largest_len == 0 {
             return;
         }
-        let dir = self.dir.clone();
-        let st = self.rooms.get_mut(&largest_id).unwrap();
-        let part_path = format!("{}/room-{:04}.part{:03}", dir, largest_id, st.part_idx);
-        let mut f = BufWriter::new(File::create(&part_path).expect("create part file"));
-        f.write_all(&st.buffer).expect("write part");
-        f.flush().expect("flush part");
-        self.total_buffered -= st.buffer.len();
-        st.buffer.clear();
-        st.buffer.shrink_to_fit();
-        st.part_idx += 1;
+        self.flush_room_buffer(largest_id);
     }
 
     pub fn write_record(&mut self, room_id: u32, json_bytes: &[u8]) {
@@ -78,7 +90,7 @@ impl RoomWriter {
         let state = self.rooms.entry(room_id).or_insert_with(|| RoomState {
             buffer: Vec::with_capacity(1024 * 1024),
             count: 0,
-            part_idx: 0,
+            recs_open: false,
         });
 
         if state.count > 0 {
@@ -89,21 +101,13 @@ impl RoomWriter {
         self.total_buffered += json_bytes.len() + 1;
 
         if state.buffer.len() >= ROOM_BUFFER_LIMIT {
-            let dir = self.dir.clone();
-            let part_path = format!("{}/room-{:04}.part{:03}", dir, room_id, state.part_idx);
-            let mut f = BufWriter::new(File::create(&part_path).expect("create part file"));
-            f.write_all(&state.buffer).expect("write part");
-            f.flush().expect("flush part");
-            self.total_buffered -= state.buffer.len();
-            state.buffer.clear();
-            state.buffer.shrink_to_fit();
-            state.part_idx += 1;
+            self.flush_room_buffer(room_id);
         } else if self.total_buffered > GLOBAL_BUFFER_CAP {
             self.spill_largest();
         }
     }
 
-    /// Finalize all rooms: write header + parts + tail per room.
+    /// Finalize all rooms: flush remaining buffers and close with `]}`.
     pub fn finalize(&mut self) -> Vec<RoomFileInfo> {
         let mut infos = Vec::new();
         let room_ids: Vec<u32> = {
@@ -114,35 +118,43 @@ impl RoomWriter {
 
         for room_id in room_ids {
             let state = self.rooms.get_mut(&room_id).unwrap();
-            let path = format!("{}/room-{:04}.json", self.dir, room_id);
-            let mut f = BufWriter::new(File::create(&path).expect("create room file"));
+            if state.count == 0 {
+                continue;
+            }
+            self.flush_room_buffer(room_id);
+            let state = self.rooms.get_mut(&room_id).unwrap();
 
+            let recs_path = format!("{}/room-{:04}.recs", self.dir, room_id);
+            let json_path = format!("{}/room-{:04}.json", self.dir, room_id);
+
+            let mut out = BufWriter::new(
+                File::create(&json_path).expect("create room json"),
+            );
             let header = format!(
                 "{{\"room_id\":{},\"dump_key\":{},\"expected_count\":{},\"records\":[",
                 room_id,
                 json_string(&self.dump_key),
                 state.count
             );
-            f.write_all(header.as_bytes()).expect("write header");
-            f.flush().expect("flush header");
+            out.write_all(header.as_bytes()).expect("write header");
 
-            // If there are parts on disk, append them (the first part
-            // starts directly; later parts continue after the final
-            // comma already present in the previous part).
-            for p in 0..state.part_idx {
-                let part_path = format!("{}/room-{:04}.part{:03}", self.dir, room_id, p);
-                let mut part = File::open(&part_path).expect("open part");
-                std::io::copy(&mut part, &mut f).expect("copy part");
-                drop(part);
-                std::fs::remove_file(&part_path).ok();
+            // Copy recs into the final file.
+            let mut recs = File::open(&recs_path).expect("open recs");
+            let mut chunk = vec![0u8; 1 << 20];
+            loop {
+                let n = recs.read(&mut chunk).expect("read recs");
+                if n == 0 {
+                    break;
+                }
+                out.write_all(&chunk[..n]).expect("copy recs");
             }
-            if !state.buffer.is_empty() {
-                f.write_all(&state.buffer).expect("write tail buffer");
-            }
-            f.write_all(b"]}").expect("write tail");
-            f.flush().expect("flush room");
+            out.write_all(b"]}").expect("write tail");
+            out.flush().expect("flush room json");
+            drop(out);
+            drop(recs);
+            std::fs::remove_file(&recs_path).ok();
 
-            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let size = std::fs::metadata(&json_path).map(|m| m.len()).unwrap_or(0);
             infos.push(RoomFileInfo {
                 name: format!("room-{:04}.json", room_id),
                 size,
@@ -152,7 +164,7 @@ impl RoomWriter {
 
             state.buffer.clear();
             state.count = 0;
-            state.part_idx = 0;
+            state.recs_open = false;
         }
         self.file_count = infos.len();
         infos

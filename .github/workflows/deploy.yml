@@ -82,6 +82,34 @@ jobs:
           docker-images: true
           swap-storage: true
 
+      - name: Aggressive disk cleanup
+        run: |
+          set -euo pipefail
+          # Remove every toolchain this pipeline does not need.
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/share/swift || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /opt/hostedtoolcache/node || true
+          sudo rm -rf /opt/hostedtoolcache/go || true
+          sudo rm -rf /opt/hostedtoolcache/Ruby || true
+          sudo rm -rf /opt/hostedtoolcache/PyPy || true
+          sudo rm -rf /opt/hostedtoolcache/Java_Temurin-Hotspot_jdk || true
+          sudo rm -rf /usr/local/.ghcup || true
+          sudo rm -rf /usr/local/share/powershell || true
+          sudo rm -rf /usr/local/share/chromium || true
+          sudo rm -rf /usr/local/lib/node_modules || true
+          sudo rm -rf /usr/local/share/edge_driver || true
+          sudo rm -rf /usr/local/share/gecko_driver || true
+          sudo rm -rf /var/lib/mysql || true
+          sudo rm -rf /var/lib/postgresql || true
+          sudo rm -rf /usr/local/julia* || true
+          sudo rm -rf /imagegeneration || true
+          sudo apt-get purge -y --auto-remove azure-cli google-chrome-stable firefox microsoft-edge-stable 2>/dev/null || true
+          sudo docker image prune -af 2>/dev/null || true
+          df -h /tmp
+
       - name: Verify disk space
         run: df -h /tmp
 

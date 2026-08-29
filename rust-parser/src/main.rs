@@ -343,7 +343,7 @@ fn process_assembled(
         lyrics_instrumental[l] = if meta.instrumental { 1 } else { 0 };
         let raw = lyrics_to_bytes(&meta);
         let compressed =
-            zstd::stream::encode_all(raw.as_slice(), 3).expect("compress lyrics");
+            zstd::stream::encode_all(raw.as_slice(), 9).expect("compress lyrics");
         lyrics_offset[l] = *lyrics_temp_offset;
         lyrics_compressed_len[l] = compressed.len() as u64;
         let mut f = std::fs::OpenOptions::new()
@@ -563,7 +563,7 @@ fn main() {
                     let meta = decode_lyrics(&cell, &lyrics_map);
                     lyrics_instrumental[lidx] = if meta.instrumental { 1 } else { 0 };
                     let raw = lyrics_to_bytes(&meta);
-                    let compressed = zstd::stream::encode_all(raw.as_slice(), 3)
+                    let compressed = zstd::stream::encode_all(raw.as_slice(), 9)
                         .expect("compress lyrics");
                     lyrics_offset[lidx] = lyrics_temp_offset;
                     lyrics_compressed_len[lidx] = compressed.len() as u64;
