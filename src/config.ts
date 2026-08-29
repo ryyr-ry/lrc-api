@@ -18,3 +18,4 @@ export const NUM_SUBS = 1;
 export const NUM_AGGREGATORS = 4;
 export const CHUNKS_PER_AGG = 50;
 export const SUBS_PER_SUPER = 4;
+export const INDEX_FILES = 4;

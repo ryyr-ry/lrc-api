@@ -1,6 +1,6 @@
 import type { RpcRequest } from "./types";
 import { fetchRoomFile } from "./types";
-import { RELEASE_TAGS, LOAD_MAX_ATTEMPTS, LOAD_RETRY_BASE_DELAY_MS } from "./config";
+import { RELEASE_TAGS, LOAD_MAX_ATTEMPTS, LOAD_RETRY_BASE_DELAY_MS, INDEX_FILES } from "./config";
 import type { Request as PartyRequest, Room, Server, Connection } from "partykit/server";
 
 export type IndexState = "unloaded" | "loading" | "ready";
@@ -12,12 +12,10 @@ function jsonResponse(data: unknown, status = 200): Response {
   });
 }
 
-const INDEX_FILENAMES = [
-  "index-0.bin",
-  "index-1.bin",
-  "index-2.bin",
-  "index-3.bin",
-];
+const INDEX_FILENAMES: string[] = [];
+for (let i = 0; i < INDEX_FILES; i++) {
+  INDEX_FILENAMES.push(`index-${i}.bin`);
+}
 
 export default class IndexServer implements Server {
   room: Room;
