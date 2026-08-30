@@ -555,9 +555,12 @@ fn main() {
 
     // Pass 1 waiting map: chains whose first overflow page has not been
     // swept yet are registered here and resolved inline when that page
-    // arrives. Only chains pointing BEHIND the sweep (page already
-    // passed) go to the pending spill for Pass 2.
+    // arrives. Chain payloads are assembled in per-chain buffers so
+    // ring size never affects correctness.
     let mut waiting: HashMap<u32, Vec<usize>> = HashMap::new();
+    // chain_buf: chain index -> assembled payload (local + collected
+    // overflow pages so far).
+    let mut chain_buf: Vec<Option<Vec<u8>>> = Vec::new();
 
     // --- sequential scan ---
     eprintln!("scanning {} pages...", page_count);
@@ -653,16 +656,20 @@ fn main() {
                     // First overflow page is still ahead: register in
                     // the waiting map and resolve when it arrives.
                     pending.push(p);
+                    chain_buf.push(None);
                     waiting.entry(pending[idx].ovfl_page).or_default().push(idx);
                 } else {
                     // Page already swept: resolved later from the ring
                     // tail or left for Pass 2.
                     pending.push(p);
+                    chain_buf.push(None);
                 }
             }
             overflow_pending_count = pending.len() as u64;
 
-            // Resolve waiting chains whose first page just arrived.
+            // Resolve waiting chains whose next page just arrived: copy
+            // this page into the chain's buffer and re-register for the
+            // following page.
             if let Some(idxs) = waiting.remove(&page_num) {
                 if !idxs.is_empty() {
                     pending_spill.flush().expect("flush pending spill");
@@ -674,43 +681,28 @@ fn main() {
                         if pending[i].resolved {
                             continue;
                         }
-                        let mut payload = vec![0u8; pending[i].local_len];
-                        rdr.seek(SeekFrom::Start(pending[i].spill_offset)).ok();
-                        rdr.read_exact(&mut payload).ok();
-                        let mut remaining = pending[i].total_payload_size - payload.len();
-                        let mut current = pending[i].ovfl_page;
-                        let mut chain_ok = true;
-                        while current != 0 && remaining > 0 {
-                            match ring.get(current) {
-                                Some(data) => {
-                                    let next = u32::from_be_bytes([
-                                        data[0], data[1], data[2], data[3],
-                                    ]);
-                                    let chunk = remaining.min(usable_size - 4);
-                                    let take = chunk.min(data.len() - 4);
-                                    payload.extend_from_slice(&data[4..4 + take]);
-                                    remaining -= take;
-                                    current = next;
-                                }
-                                None => {
-                                    if current > page_num {
-                                        waiting.entry(current).or_default().push(i);
-                                    }
-                                    chain_ok = false;
-                                    break;
-                                }
-                            }
+                        if chain_buf[i].is_none() {
+                            let mut local = vec![0u8; pending[i].local_len];
+                            rdr.seek(SeekFrom::Start(pending[i].spill_offset)).ok();
+                            rdr.read_exact(&mut local).ok();
+                            chain_buf[i] = Some(local);
                         }
-                        if chain_ok && remaining == 0 {
-                            if std::env::var("WM_DEBUG").is_ok() {
-                                eprintln!(
-                                    "WM resolve lid={} rowid={} total={} local={}",
-                                    pending[i].rowid,
-                                    pending[i].rowid,
-                                    pending[i].total_payload_size,
-                                    pending[i].local_len
-                                );
-                            }
+                        let data = page_buffer.clone();
+                        let next = u32::from_be_bytes([
+                            data[0], data[1], data[2], data[3],
+                        ]);
+                        let chunk = (pending[i].total_payload_size
+                            - chain_buf[i].as_ref().unwrap().len())
+                        .min(usable_size - 4);
+                        let take = chunk.min(data.len() - 4);
+                        chain_buf[i]
+                            .as_mut()
+                            .unwrap()
+                            .extend_from_slice(&data[4..4 + take]);
+                        let remaining = pending[i].total_payload_size
+                            - chain_buf[i].as_ref().unwrap().len();
+                        if remaining == 0 {
+                            let payload = chain_buf[i].take().unwrap();
                             if process_assembled(
                                 &payload,
                                 pending[i].rowid,
@@ -740,6 +732,8 @@ fn main() {
                             ) {
                                 pending[i].resolved = true;
                             }
+                        } else if next != 0 {
+                            waiting.entry(next).or_default().push(i);
                         }
                     }
                 }
@@ -825,9 +819,6 @@ fn main() {
         let mut header_prefix2 = [0u8; 100];
         gz2.read_exact(&mut header_prefix2).ok();
         let mut resolved = 0usize;
-        // Pass 2 keeps its own forward window; the pass-1 ring is left
-        // intact for chains whose pages sit behind the chain start.
-        let mut ring2 = sqlite::RingBuffer::new(ring_pages());
         let mut page = vec![0u8; page_size];
         for pn in 1..=page_count as u32 {
             if pn == 1 {
@@ -842,14 +833,13 @@ fn main() {
                     Err(_) => break,
                 }
             }
-            ring2.put(pn, page.clone());
 
             if let Some(idxs) = waiting.remove(&pn) {
                 for &i in &idxs {
                     if chains[i].resolved {
                         continue;
                     }
-                    // Ensure the local payload is loaded into assembled.
+                    // Load the local payload on first touch.
                     if assembled[i].is_none() {
                         let mut local = vec![0u8; chains[i].local_len];
                         spill_reader
@@ -858,34 +848,17 @@ fn main() {
                         spill_reader.read_exact(&mut local).ok();
                         assembled[i] = Some(local);
                     }
-                    let mut buf = assembled[i].take().unwrap();
-                    let mut remaining = chains[i].total_size - buf.len();
-                    let mut current = chains[i].next_page;
-                    let mut chain_ok = true;
-                    while current != 0 && remaining > 0 {
-                        let data = match ring.get(current)
-                            .or_else(|| ring2.get(current))
-                        {
-                            Some(d) => d,
-                            None => {
-                                // Not in either ring: if this page is
-                                // still ahead in pass 2, keep waiting.
-                                chain_ok = false;
-                                break;
-                            }
-                        };
-                        let next = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
-                        let chunk = remaining.min(usable_size - 4);
-                        let take = chunk.min(data.len() - 4);
-                        buf.extend_from_slice(&data[4..4 + take]);
-                        remaining -= take;
-                        current = next;
-                    }
+                    let data = page.clone();
+                    let next = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+                    let buf = assembled[i].as_mut().unwrap();
+                    let chunk = (chains[i].total_size - buf.len()).min(usable_size - 4);
+                    let take = chunk.min(data.len() - 4);
+                    buf.extend_from_slice(&data[4..4 + take]);
+                    let remaining = chains[i].total_size - buf.len();
                     if remaining == 0 {
-                        // Fully assembled regardless of whether the
-                        // chain pointer ended at 0.
+                        let payload = assembled[i].take().unwrap();
                         if process_assembled(
-                            &buf,
+                            &payload,
                             chains[i].rowid,
                             tracks_ncols,
                             lyrics_ncols,
@@ -915,21 +888,8 @@ fn main() {
                             resolved += 1;
                         }
                         assembled[i] = None;
-                    } else {
-                        // Chain incomplete: either a needed page has not
-                        // been swept yet, or the chain is corrupt.
-                        if chain_ok && current == 0 {
-                            // Chain ended before payload complete: corrupt.
-                            assembled[i] = None;
-                            chains[i].resolved = true; // do not retry
-                        } else if !chain_ok && current != 0 {
-                            // The next page is still ahead; wait for it.
-                            assembled[i] = Some(buf);
-                            waiting.entry(current).or_default().push(i);
-                        } else {
-                            assembled[i] = None;
-                            chains[i].resolved = true; // do not retry
-                        }
+                    } else if next != 0 {
+                        waiting.entry(next).or_default().push(i);
                     }
                 }
             }
