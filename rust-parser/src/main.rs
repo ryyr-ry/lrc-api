@@ -553,6 +553,12 @@ fn main() {
     let mut pending_spill = BufWriter::with_capacity(1 << 20, pending_spill_file);
     let mut pending_spill_offset: u64 = 0;
 
+    // Pass 1 waiting map: chains whose first overflow page has not been
+    // swept yet are registered here and resolved inline when that page
+    // arrives. Only chains pointing BEHIND the sweep (page already
+    // passed) go to the pending spill for Pass 2.
+    let mut waiting: HashMap<u32, Vec<usize>> = HashMap::new();
+
     // --- sequential scan ---
     eprintln!("scanning {} pages...", page_count);
     // Reopen the gzip and keep the 100-byte DB header as the prefix of
@@ -635,18 +641,109 @@ fn main() {
                     lc += 1;
                 }
             }
-            let new_pending_start = pending.len();
-            pending.append(&mut unresolved);
-            // Spill local payloads of new pending entries to disk and
-            // drop them from memory.
-            for p in pending.iter_mut().skip(new_pending_start) {
-                p.spill_offset = pending_spill_offset;
+            for mut p in unresolved.drain(..) {
+                let off = pending_spill_offset;
                 pending_spill.write_all(&p.local_payload).expect("spill payload");
                 pending_spill_offset += p.local_payload.len() as u64;
+                p.spill_offset = off;
                 p.local_payload.clear();
                 p.local_payload.shrink_to_fit();
+                let idx = pending.len();
+                if p.ovfl_page > page_num {
+                    // First overflow page is still ahead: register in
+                    // the waiting map and resolve when it arrives.
+                    pending.push(p);
+                    waiting.entry(pending[idx].ovfl_page).or_default().push(idx);
+                } else {
+                    // Page already swept: resolved later from the ring
+                    // tail or left for Pass 2.
+                    pending.push(p);
+                }
             }
             overflow_pending_count = pending.len() as u64;
+
+            // Resolve waiting chains whose first page just arrived.
+            if let Some(idxs) = waiting.remove(&page_num) {
+                if !idxs.is_empty() {
+                    pending_spill.flush().expect("flush pending spill");
+                    let spill_read = std::fs::File::open(pending_spill_path)
+                        .expect("open pending spill for read");
+                    let mut rdr =
+                        std::io::BufReader::with_capacity(1 << 20, spill_read);
+                    for i in idxs {
+                        if pending[i].resolved {
+                            continue;
+                        }
+                        let mut payload = vec![0u8; pending[i].local_len];
+                        rdr.seek(SeekFrom::Start(pending[i].spill_offset)).ok();
+                        rdr.read_exact(&mut payload).ok();
+                        let mut remaining = pending[i].total_payload_size - payload.len();
+                        let mut current = pending[i].ovfl_page;
+                        let mut chain_ok = true;
+                        while current != 0 && remaining > 0 {
+                            match ring.get(current) {
+                                Some(data) => {
+                                    let next = u32::from_be_bytes([
+                                        data[0], data[1], data[2], data[3],
+                                    ]);
+                                    let chunk = remaining.min(usable_size - 4);
+                                    let take = chunk.min(data.len() - 4);
+                                    payload.extend_from_slice(&data[4..4 + take]);
+                                    remaining -= take;
+                                    current = next;
+                                }
+                                None => {
+                                    if current > page_num {
+                                        waiting.entry(current).or_default().push(i);
+                                    }
+                                    chain_ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if chain_ok && remaining == 0 {
+                            if std::env::var("WM_DEBUG").is_ok() {
+                                eprintln!(
+                                    "WM resolve lid={} rowid={} total={} local={}",
+                                    pending[i].rowid,
+                                    pending[i].rowid,
+                                    pending[i].total_payload_size,
+                                    pending[i].local_len
+                                );
+                            }
+                            if process_assembled(
+                                &payload,
+                                pending[i].rowid,
+                                tracks_ncols,
+                                lyrics_ncols,
+                                &tracks_map,
+                                &lyrics_map,
+                                &mut max_tid,
+                                &mut max_lid,
+                                &mut track_names,
+                                &mut track_artists,
+                                &mut track_albums,
+                                &mut track_durations,
+                                &mut room_indices,
+                                &mut next_track,
+                                &mut matched,
+                                &mut lyrics_first,
+                                &mut null_ids,
+                                &mut lyrics_chunk,
+                                &mut lyrics_offset,
+                                &mut lyrics_compressed_len,
+                                &mut lyrics_instrumental,
+                                &mut lyrics_spill,
+                                num_rooms,
+                                &mut tc,
+                                &mut lc,
+                            ) {
+                                pending[i].resolved = true;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         page_num += 1;
@@ -674,13 +771,12 @@ fn main() {
     lyrics_spill.finish();
     eprintln!("lyrics chunks written: {}", lyrics_spill.current_chunk);
 
-    // --- Pass 2: resolve pending overflows with one sequential sweep ---
-    // Chains are assembled via a waiting map: when a chain's page
-    // arrives in the sweep, its data is kept until the chain resolves.
-    // Chains whose pages were already swept are resolved from the ring
-    // buffer when possible, else reported unresolved.
-    if !pending.is_empty() {
-        eprintln!("pass 2: resolving {} pending overflows", pending.len());
+    // --- Pass 2: resolve remaining pending overflows with one sequential
+    // sweep. Only chains not resolved inline during pass 1 (their first
+    // overflow page was already swept) remain here.
+    let unresolved_count = pending.iter().filter(|p| !p.resolved).count();
+    if unresolved_count > 0 {
+        eprintln!("pass 2: resolving {} pending overflows", unresolved_count);
         pending_spill.flush().expect("flush pending spill");
         drop(pending_spill);
         pending.sort_by_key(|p| p.ovfl_page);
@@ -696,6 +792,7 @@ fn main() {
         }
         let mut chains: Vec<ChainState> = pending
             .iter()
+            .filter(|p| !p.resolved)
             .map(|p| ChainState {
                 spill_offset: p.spill_offset,
                 total_size: p.total_payload_size,
@@ -840,9 +937,16 @@ fn main() {
         eprintln!(
             "pass 2 done: resolved {}/{} ({:.1}s)",
             resolved,
-            pending.len(),
+            chains.len(),
             t0.elapsed().as_secs()
         );
+        let unresolved_count = chains.len() - resolved;
+        if unresolved_count > 0 {
+            eprintln!(
+                "WARNING: {} overflow chains could not be resolved",
+                unresolved_count
+            );
+        }
     }
 
     // Flush any lyrics written during pass 2 before reading back.
