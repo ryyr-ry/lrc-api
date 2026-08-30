@@ -14,12 +14,13 @@ const KNOWN_LYRICS_COUNT: u64 = 32_680_034;
 const ROOM_TARGET_JSON_BYTES: u64 = 48 * 1024 * 1024;
 fn ring_pages() -> usize {
     // Allows testing Pass 2 with a small ring: RING_PAGES env var.
-    // Default 2M pages (8GB at 4KiB pages) resolves most overflow
-    // chains inline during pass 1.
+    // Default 192K pages (768MB at 4KiB pages). Total memory budget on
+    // the 7GB GitHub runner: ring 0.75GB + track arrays ~4GB + index
+    // arrays ~1.3GB + misc ~0.5GB = ~6.6GB.
     std::env::var("RING_PAGES")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(2_000_000)
+        .unwrap_or(192_000)
 }
 
 const INDEX_PART_U16S: usize = (16 * 1024 * 1024) / 2;
