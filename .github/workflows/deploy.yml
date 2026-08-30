@@ -162,6 +162,25 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Retry a gh command on rate-limit/5xx with exponential backoff.
+          gh_retry() {
+            local attempt=0
+            local max_attempts=6
+            while true; do
+              if "$@" 2>/tmp/gh_err.log; then
+                return 0
+              fi
+              attempt=$((attempt + 1))
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                cat /tmp/gh_err.log >&2
+                return 1
+              fi
+              local wait=$((2 ** attempt * 15))
+              echo "gh failed (attempt $attempt), retrying in ${wait}s" >&2
+              sleep "$wait"
+            done
+          }
+
           ROOMS_PER_RELEASE=$(jq -r '.rooms_per_release' "$MANIFEST_PATH")
           DUMP_KEY=$(jq -r '.dump_key' "$MANIFEST_PATH")
           TAGS=$(jq -r '.release_tags[]' "$MANIFEST_PATH")
@@ -181,13 +200,29 @@ jobs:
               if [ -n "$GROUP_FILES" ]; then
                 TAG=$(printf '%s\n' "$TAGS" | sed -n "$((GROUP + 1))p")
                 echo "Release $TAG: $COUNT rooms"
-                gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
-                gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+                gh_retry gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+                gh_retry gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
                   --title "Room data group $GROUP (auto)" \
                   --notes "Room group $GROUP for $DUMP_KEY" \
                   --prerelease --draft
-                gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber $GROUP_FILES
-                gh release edit "$TAG" --draft=false --repo "$GITHUB_REPOSITORY"
+                # Upload in chunks of 50 files with a pause between
+                # chunks to stay under the uploads API rate limit.
+                CHUNK_FILES=""
+                CHUNK_N=0
+                for gf in $GROUP_FILES; do
+                  CHUNK_FILES="$CHUNK_FILES $gf"
+                  CHUNK_N=$((CHUNK_N + 1))
+                  if [ "$CHUNK_N" -ge 50 ]; then
+                    gh_retry gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber $CHUNK_FILES
+                    sleep 20
+                    CHUNK_FILES=""
+                    CHUNK_N=0
+                  fi
+                done
+                if [ -n "$CHUNK_FILES" ]; then
+                  gh_retry gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber $CHUNK_FILES
+                fi
+                gh_retry gh release edit "$TAG" --draft=false --repo "$GITHUB_REPOSITORY"
               fi
               GROUP=$RI
               COUNT=0
@@ -199,31 +234,45 @@ jobs:
           if [ -n "$GROUP_FILES" ]; then
             TAG=$(printf '%s\n' "$TAGS" | sed -n "$((GROUP + 1))p")
             echo "Release $TAG: $COUNT rooms"
-            gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
-            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+            gh_retry gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+            gh_retry gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
               --title "Room data group $GROUP (auto)" \
               --notes "Room group $GROUP for $DUMP_KEY" \
               --prerelease --draft
-            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber $GROUP_FILES
-            gh release edit "$TAG" --draft=false --repo "$GITHUB_REPOSITORY"
+            CHUNK_FILES=""
+            CHUNK_N=0
+            for gf in $GROUP_FILES; do
+              CHUNK_FILES="$CHUNK_FILES $gf"
+              CHUNK_N=$((CHUNK_N + 1))
+              if [ "$CHUNK_N" -ge 50 ]; then
+                gh_retry gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber $CHUNK_FILES
+                sleep 20
+                CHUNK_FILES=""
+                CHUNK_N=0
+              fi
+            done
+            if [ -n "$CHUNK_FILES" ]; then
+              gh_retry gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber $CHUNK_FILES
+            fi
+            gh_retry gh release edit "$TAG" --draft=false --repo "$GITHUB_REPOSITORY"
           fi
 
           # index files go to the last release tag
           LAST_TAG=$(printf '%s\n' "$TAGS" | tail -n 1)
           echo "Uploading index files to $LAST_TAG"
-          gh release upload "$LAST_TAG" --repo "$GITHUB_REPOSITORY" --clobber index-*.bin
+          gh_retry gh release upload "$LAST_TAG" --repo "$GITHUB_REPOSITORY" --clobber index-*.bin
 
           cd "$GITHUB_WORKSPACE"
 
-          gh release delete "$RELEASE_TAG" --yes --cleanup-tag 2>/dev/null || true
-          gh release create "$RELEASE_TAG" \
+          gh_retry gh release delete "$RELEASE_TAG" --yes --cleanup-tag 2>/dev/null || true
+          gh_retry gh release create "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --title "Room manifest (auto)" \
             --notes "Manifest for $DUMP_KEY" \
             --prerelease --draft
-          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+          gh_retry gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber \
             "$MANIFEST_PATH" "src/config.ts"
-          gh release edit "$RELEASE_TAG" --draft=false --repo "$GITHUB_REPOSITORY"
+          gh_retry gh release edit "$RELEASE_TAG" --draft=false --repo "$GITHUB_REPOSITORY"
 
           echo "All release groups published"
 
