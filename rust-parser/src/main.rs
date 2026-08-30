@@ -34,6 +34,8 @@ struct LyricsSpill {
     current_chunk: u32,
     current_written: u64,
     file: Option<BufWriter<std::fs::File>>,
+    compressor: Option<zstd::bulk::Compressor<'static>>,
+    comp_buf: Vec<u8>,
 }
 
 impl LyricsSpill {
@@ -56,6 +58,8 @@ impl LyricsSpill {
             current_chunk: 0,
             current_written: 0,
             file: None,
+            compressor: None,
+            comp_buf: Vec::with_capacity(64 * 1024),
         }
     }
 
@@ -88,20 +92,25 @@ impl LyricsSpill {
     /// (chunk, offset, compressed_len).
     fn write_lyrics(&mut self, raw: &[u8]) -> (u32, u64, u64) {
         self.ensure_file();
-        let compressed = zstd::bulk::compress(raw, 3).expect("compress lyrics");
+        if self.compressor.is_none() {
+            self.compressor = Some(zstd::bulk::Compressor::new(3).expect("zstd compressor"));
+        }
+        let comp = self.compressor.as_mut().unwrap();
+        let len = comp
+            .compress_to_buffer(raw, &mut self.comp_buf)
+            .expect("compress lyrics");
         let before = self.current_written;
-        let len = compressed.len() as u64;
         self.file
             .as_mut()
             .unwrap()
-            .write_all(&compressed)
+            .write_all(&self.comp_buf[..len])
             .expect("write lyrics frame");
-        self.current_written += len;
+        self.current_written += len as u64;
         let chunk = self.current_chunk;
         if self.current_written >= LYRICS_CHUNK_BYTES {
             self.rotate();
         }
-        (chunk, before, len)
+        (chunk, before, len as u64)
     }
 
     fn finish(&mut self) {
@@ -953,6 +962,11 @@ fn main() {
             }
         }
     }
+    // Sort each chunk's lids by frame offset so the read-back is
+    // sequential within the chunk (no seeks after the first).
+    for lids in chunk_lids.iter_mut() {
+        lids.sort_unstable_by_key(|&l| lyrics_offset[l as usize]);
+    }
     for chunk in 0..total_chunks {
         let chunk_path = LyricsSpill::chunk_path(chunk as u32);
         if !std::path::Path::new(&chunk_path).exists() {
@@ -961,6 +975,8 @@ fn main() {
         let lyrics_temp_reader =
             std::fs::File::open(&chunk_path).expect("open lyrics chunk");
         let mut lyrics_reader = BufReader::with_capacity(1 << 20, lyrics_temp_reader);
+        // Reused decompressor avoids per-frame context allocation.
+        let mut decompressor = zstd::bulk::Decompressor::new().expect("zstd decompressor");
         for &lid in &chunk_lids[chunk] {
             let lid = lid as usize;
             if lyrics_chunk[lid] != chunk as u32 || lyrics_compressed_len[lid] == 0 {
@@ -968,14 +984,19 @@ fn main() {
             }
             let off = lyrics_offset[lid];
             let clen = lyrics_compressed_len[lid] as usize;
-            lyrics_reader
-                .seek(SeekFrom::Start(off))
-                .expect("seek lyrics frame");
+            // Sequential within the chunk after sorting by offset: skip
+            // the seek when already positioned at the frame.
+            if lyrics_reader.stream_position().ok() != Some(off) {
+                lyrics_reader
+                    .seek(SeekFrom::Start(off))
+                    .expect("seek lyrics frame");
+            }
             let mut compressed = vec![0u8; clen];
             lyrics_reader
                 .read_exact(&mut compressed)
                 .expect("read lyrics frame");
-            let raw = zstd::bulk::decompress(compressed.as_slice(), 1 << 20)
+            let raw = decompressor
+                .decompress(compressed.as_slice(), 1 << 20)
                 .expect("decompress lyrics frame");
             let ly = parse_lyrics_bytes(&raw);
             let instrumental = lyrics_instrumental[lid] == 1;
