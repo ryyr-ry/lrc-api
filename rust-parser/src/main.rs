@@ -579,7 +579,7 @@ fn main() {
     // page 1. The scan must not skip the header separately, or every
     // subsequent page boundary shifts by 100 bytes.
     let mut gz = GzDecoder::new(BufReader::with_capacity(
-        1 << 20,
+        16 << 20,
         std::fs::File::open(gz_path).expect("reopen gzip"),
     ));
     let mut header_prefix = [0u8; 100];
@@ -824,7 +824,7 @@ fn main() {
         let mut assembled: Vec<Option<Vec<u8>>> = vec![None; chains.len()];
 
         let mut gz2 = GzDecoder::new(BufReader::with_capacity(
-            1 << 20,
+            16 << 20,
             std::fs::File::open(gz_path).expect("reopen gzip for pass 2"),
         ));
         let mut header_prefix2 = [0u8; 100];
