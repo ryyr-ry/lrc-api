@@ -21,6 +21,10 @@ env:
 permissions:
   contents: write
 
+concurrency:
+  group: deploy-lrc-api
+  cancel-in-progress: false
+
 jobs:
   detect:
     name: Detect dump update
