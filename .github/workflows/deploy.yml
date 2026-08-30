@@ -162,21 +162,28 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Retry a gh command on rate-limit/5xx with exponential backoff.
+          # Retry a gh command on rate-limit/5xx with long backoff: the
+          # installation token allows 5000 requests/hour and recovers
+          # over time, so long waits eventually succeed.
           gh_retry() {
             local attempt=0
-            local max_attempts=6
+            local max_attempts=12
             while true; do
               if "$@" 2>/tmp/gh_err.log; then
-                return 0
+                # gh exits 0 even for some failures; check stderr too.
+                if grep -q "403\|rate limit\|429" /tmp/gh_err.log 2>/dev/null; then
+                  : # fall through to retry
+                else
+                  return 0
+                fi
               fi
               attempt=$((attempt + 1))
               if [ "$attempt" -ge "$max_attempts" ]; then
                 cat /tmp/gh_err.log >&2
                 return 1
               fi
-              local wait=$((2 ** attempt * 15))
-              echo "gh failed (attempt $attempt), retrying in ${wait}s" >&2
+              local wait=$((attempt * 60))
+              echo "gh rate-limited (attempt $attempt), waiting ${wait}s" >&2
               sleep "$wait"
             done
           }
