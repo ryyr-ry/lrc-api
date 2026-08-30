@@ -287,37 +287,48 @@ pub fn decode_record(payload: Vec<u8>) -> Option<DecodedCell> {
 }
 
 /// A ring buffer of recently seen pages keyed by page number.
+/// Uses a slab of Option<Vec<u8>> indexed by page number modulo
+/// capacity, which avoids HashMap overhead for very large rings.
 pub struct RingBuffer {
     capacity: usize,
-    order: std::collections::VecDeque<u32>,
-    pages: HashMap<u32, Vec<u8>>,
+    mask: usize,
+    slots: Vec<Option<Vec<u8>>>,
+    marks: Vec<u32>,
 }
 
 impl RingBuffer {
     pub fn new(capacity: usize) -> Self {
+        // Round capacity up to a power of two for fast modulo.
+        let mut cap = capacity.next_power_of_two().max(1);
+        if cap < 256 {
+            cap = 256;
+        }
         RingBuffer {
-            capacity,
-            order: std::collections::VecDeque::with_capacity(capacity),
-            pages: HashMap::with_capacity(capacity),
+            capacity: cap,
+            mask: cap - 1,
+            slots: vec![None; cap],
+            marks: vec![u32::MAX; cap],
         }
     }
 
     pub fn put(&mut self, page_num: u32, page_data: Vec<u8>) {
-        if self.order.len() >= self.capacity {
-            if let Some(oldest) = self.order.pop_front() {
-                self.pages.remove(&oldest);
-            }
-        }
-        self.order.push_back(page_num);
-        self.pages.insert(page_num, page_data);
+        let slot = (page_num as usize) & self.mask;
+        self.slots[slot] = Some(page_data);
+        self.marks[slot] = page_num;
     }
 
     pub fn get(&self, page_num: u32) -> Option<&Vec<u8>> {
-        self.pages.get(&page_num)
+        let slot = (page_num as usize) & self.mask;
+        if self.marks[slot] == page_num {
+            self.slots[slot].as_ref()
+        } else {
+            None
+        }
     }
 
     pub fn contains(&self, page_num: u32) -> bool {
-        self.pages.contains_key(&page_num)
+        let slot = (page_num as usize) & self.mask;
+        self.marks[slot] == page_num
     }
 }
 

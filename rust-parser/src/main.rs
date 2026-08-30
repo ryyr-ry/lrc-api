@@ -14,10 +14,12 @@ const KNOWN_LYRICS_COUNT: u64 = 32_680_034;
 const ROOM_TARGET_JSON_BYTES: u64 = 48 * 1024 * 1024;
 fn ring_pages() -> usize {
     // Allows testing Pass 2 with a small ring: RING_PAGES env var.
+    // Default 2M pages (8GB at 4KiB pages) resolves most overflow
+    // chains inline during pass 1.
     std::env::var("RING_PAGES")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(65_536)
+        .unwrap_or(2_000_000)
 }
 
 const INDEX_PART_U16S: usize = (16 * 1024 * 1024) / 2;
