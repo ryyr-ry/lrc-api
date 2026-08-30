@@ -97,9 +97,22 @@ impl LyricsSpill {
             self.compressor = Some(zstd::bulk::Compressor::new(3).expect("zstd compressor"));
         }
         let comp = self.compressor.as_mut().unwrap();
-        let len = comp
-            .compress_to_buffer(raw, &mut self.comp_buf)
-            .expect("compress lyrics");
+        // Ensure the reusable buffer can hold the worst-case compressed
+        // size (input + frame overhead), growing it on demand.
+        let needed = raw.len() + 1024 + zstd::zstd_safe::compress_bound(raw.len());
+        if self.comp_buf.len() < needed {
+            self.comp_buf.resize(needed, 0);
+        }
+        let len = loop {
+            match comp.compress_to_buffer(raw, &mut self.comp_buf) {
+                Ok(len) => break len,
+                Err(_) => {
+                    // Buffer too small: grow and retry.
+                    let new_cap = (self.comp_buf.len() * 2).max(raw.len() * 2 + 4096);
+                    self.comp_buf.resize(new_cap, 0);
+                }
+            }
+        };
         let before = self.current_written;
         self.file
             .as_mut()
