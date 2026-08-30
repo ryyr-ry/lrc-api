@@ -136,7 +136,9 @@ impl RoomWriter {
             {
                 let out_file = File::create(&json_path).expect("create room json.gz");
 
-                // gzip member 1: header
+                // gzip member 1: header. GzEncoder::finish() returns
+                // the underlying file, keeping one handle open for the
+                // whole concatenation.
                 let mut enc = GzEncoder::new(out_file, Compression::default());
                 let header = format!(
                     "{{\"room_id\":{},\"dump_key\":{},\"expected_count\":{},\"records\":[",
@@ -145,33 +147,22 @@ impl RoomWriter {
                     state.count
                 );
                 enc.write_all(header.as_bytes()).expect("write header");
-                enc.finish().expect("finish header member");
+                let mut out = enc.finish().expect("finish header member");
 
                 // recs members are already valid gzip members; copy raw.
                 let mut recs = File::open(&recs_path).expect("open recs");
-                let mut chunk = vec![0u8; 1 << 20];
+                let mut chunk = vec![0u8; 4 << 20];
                 loop {
                     let n = recs.read(&mut chunk).expect("read recs");
                     if n == 0 {
                         break;
                     }
-                    // Append after the header member; open the file in
-                    // append mode for this copy.
-                    let mut app = OpenOptions::new()
-                        .append(true)
-                        .open(&json_path)
-                        .expect("open json.gz for append");
-                    app.write_all(&chunk[..n]).expect("copy recs");
-                    app.flush().expect("flush copy");
+                    out.write_all(&chunk[..n]).expect("copy recs");
                 }
                 drop(recs);
 
-                // gzip member 3: tail
-                let mut app = OpenOptions::new()
-                    .append(true)
-                    .open(&json_path)
-                    .expect("open json.gz for tail");
-                let mut enc_tail = GzEncoder::new(app, Compression::default());
+                // gzip member 3: tail on the same file handle.
+                let mut enc_tail = GzEncoder::new(out, Compression::default());
                 enc_tail.write_all(b"]}").expect("write tail");
                 enc_tail.finish().expect("finish tail member");
             }
