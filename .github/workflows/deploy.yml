@@ -145,9 +145,41 @@ jobs:
             gh release delete "$tag" --yes --cleanup-tag 2>/dev/null || true
           done
 
-          # Group room files by release index and upload each group
-          # slowly enough to stay under the 5000/hour rate limit
-          # (one file per ~1.2s keeps ~3000 requests per hour).
+          # Group room files by release index and upload each group.
+          # Two parallel uploaders at ~0.9s per file stay near 4000
+          # requests/hour, safely under the 5000/hour limit, and
+          # finish 5400 files in about 45 minutes.
+          upload_all() {
+            local tag="$1"
+            shift
+            local files="$*"
+            local total=0
+            for gf in $files; do
+              total=$((total + 1))
+            done
+            local half=$(( (total + 1) / 2 ))
+            local n=0
+            (
+              for gf in $files; do
+                n=$((n + 1))
+                if [ "$n" -le "$half" ]; then
+                  gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber "$gf" 2>/dev/null
+                  sleep 1.8
+                fi
+              done
+            ) &
+            local pid1=$!
+            n=0
+            for gf in $files; do
+              n=$((n + 1))
+              if [ "$n" -gt "$half" ]; then
+                gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber "$gf" 2>/dev/null
+                sleep 1.8
+              fi
+            done
+            wait "$pid1"
+          }
+
           GROUP=-1
           COUNT=0
           GROUP_FILES=""
@@ -162,11 +194,14 @@ jobs:
                   --title "Room data group $GROUP (auto)" \
                   --notes "Room group $GROUP for $DUMP_KEY" \
                   --prerelease --draft
-                for gf in $GROUP_FILES; do
-                  gh_retry gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "$gf"
-                  sleep 1.2
-                done
+                upload_all "$TAG" $GROUP_FILES
                 gh_retry gh release edit "$TAG" --draft=false --repo "$GITHUB_REPOSITORY"
+                EXPECTED=$COUNT
+                ACTUAL=$(gh api repos/"$GITHUB_REPOSITORY"/releases/tags/"$TAG" --jq '.assets | length' 2>/dev/null || echo 0)
+                echo "Verification $TAG: expected $EXPECTED assets, actual $ACTUAL"
+                if [ "$ACTUAL" != "$EXPECTED" ]; then
+                  echo "::error::Asset count mismatch for $TAG"
+                fi
               fi
               GROUP=$RI
               COUNT=0
@@ -182,11 +217,14 @@ jobs:
               --title "Room data group $GROUP (auto)" \
               --notes "Room group $GROUP for $DUMP_KEY" \
               --prerelease --draft
-            for gf in $GROUP_FILES; do
-              gh_retry gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "$gf"
-              sleep 1.2
-            done
+            upload_all "$TAG" $GROUP_FILES
             gh_retry gh release edit "$TAG" --draft=false --repo "$GITHUB_REPOSITORY"
+            EXPECTED=$COUNT
+            ACTUAL=$(gh api repos/"$GITHUB_REPOSITORY"/releases/tags/"$TAG" --jq '.assets | length' 2>/dev/null || echo 0)
+            echo "Verification $TAG: expected $EXPECTED assets, actual $ACTUAL"
+            if [ "$ACTUAL" != "$EXPECTED" ]; then
+              echo "::error::Asset count mismatch for $TAG"
+            fi
           fi
 
           # index files go to the last release tag
