@@ -2,7 +2,7 @@ name: Deploy LRC API
 
 on:
   schedule:
-    - cron: "0 */6 * * *"
+    - cron: "0 0 * * *"
   workflow_dispatch:
     inputs:
       force:
@@ -67,24 +67,9 @@ jobs:
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"
           fi
-          URL="${DUMP_BASE_URL}${KEY}"
-          echo "dump_key=$KEY" >> "$GITHUB_OUTPUT"
-          echo "dump_url=$URL" >> "$GITHUB_OUTPUT"
-          echo "Latest dump: $KEY"
-          PREV=""
-          if curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/manifest.json" -o /tmp/prev_manifest.json 2>/dev/null; then
-            PREV=$(jq -r '.dump_key // empty' /tmp/prev_manifest.json 2>/dev/null || true)
-          fi
-          echo "Previous dump: ${PREV:-none}"
-          FORCE="${{ github.event.inputs.force }}"
-          if [ -z "${PREV:-}" ] || [ "$KEY" != "$PREV" ] || [ "$FORCE" = "true" ]; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          fi
 
   generate:
-    name: Generate rooms and upload to Releases
+    name: Generate rooms and publish
     runs-on: ubuntu-latest
     needs: detect
     if: needs.detect.outputs.changed == 'true'
@@ -101,42 +86,6 @@ jobs:
           large-packages: true
           docker-images: true
           swap-storage: true
-
-      - name: Aggressive disk cleanup
-        run: |
-          set -euo pipefail
-          # Remove every toolchain this pipeline does not need.
-          sudo rm -rf /usr/local/lib/android || true
-          sudo rm -rf /usr/share/dotnet || true
-          sudo rm -rf /usr/share/swift || true
-          sudo rm -rf /opt/ghc || true
-          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
-          sudo rm -rf /opt/hostedtoolcache/node || true
-          sudo rm -rf /opt/hostedtoolcache/go || true
-          sudo rm -rf /opt/hostedtoolcache/Ruby || true
-          sudo rm -rf /opt/hostedtoolcache/PyPy || true
-          sudo rm -rf /opt/hostedtoolcache/Java_Temurin-Hotspot_jdk || true
-          sudo rm -rf /usr/local/.ghcup || true
-          sudo rm -rf /usr/local/share/powershell || true
-          sudo rm -rf /usr/local/share/chromium || true
-          sudo rm -rf /usr/local/lib/node_modules || true
-          sudo rm -rf /usr/local/share/edge_driver || true
-          sudo rm -rf /usr/local/share/gecko_driver || true
-          sudo rm -rf /var/lib/mysql || true
-          sudo rm -rf /var/lib/postgresql || true
-          sudo rm -rf /usr/local/julia* || true
-          sudo rm -rf /imagegeneration || true
-          sudo rm -rf /usr/local/python || true
-          sudo rm -rf /opt/hostedtoolcache/Python || true
-          sudo rm -rf /usr/lib/python3 || true
-          sudo rm -rf /usr/lib/python3.12 || true
-          sudo rm -rf /usr/lib/pypy3 || true
-          sudo apt-get purge -y --auto-remove azure-cli google-chrome-stable firefox microsoft-edge-stable 2>/dev/null || true
-          sudo docker image prune -af 2>/dev/null || true
-          df -h /tmp
-
-      - name: Verify disk space
-        run: df -h /tmp
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -156,22 +105,19 @@ jobs:
           ./rust-parser/target/release/lrc-room-generator "$GZIP_PATH" "$MANIFEST_PATH" "src/config.ts" "$CHUNK_DIR" "${{ needs.detect.outputs.dump_key }}"
           df -h /tmp
 
-      - name: Upload to Releases
+      - name: Publish to GitHub Releases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
-          # Retry a gh command on rate-limit/5xx with long backoff: the
-          # installation token allows 5000 requests/hour and recovers
-          # over time, so long waits eventually succeed.
+          # Retry a gh command on rate-limit/5xx with long backoff.
           gh_retry() {
             local attempt=0
-            local max_attempts=12
+            local max_attempts=24
             while true; do
               if "$@" 2>/tmp/gh_err.log; then
-                # gh exits 0 even for some failures; check stderr too.
-                if grep -q "403\|rate limit\|429" /tmp/gh_err.log 2>/dev/null; then
+                if grep -q "403\|rate limit\|429\|502\|503" /tmp/gh_err.log 2>/dev/null; then
                   : # fall through to retry
                 else
                   return 0
@@ -194,8 +140,14 @@ jobs:
 
           cd "$CHUNK_DIR"
 
-          # Group room files by release index (room id / rooms_per_release)
-          # and upload each group to its own release tag.
+          # Clean up stale draft releases left by previous failed runs.
+          for tag in $(gh api repos/"$GITHUB_REPOSITORY"/releases --paginate --jq '.[] | select(.draft == true and (.tag_name | startswith("rooms-"))) | .tag_name' 2>/dev/null || true); do
+            gh release delete "$tag" --yes --cleanup-tag 2>/dev/null || true
+          done
+
+          # Group room files by release index and upload each group
+          # slowly enough to stay under the 5000/hour rate limit
+          # (one file per ~1.2s keeps ~3000 requests per hour).
           GROUP=-1
           COUNT=0
           GROUP_FILES=""
@@ -203,32 +155,17 @@ jobs:
             RID=$(( 10#$(printf '%s' "$f" | tr -dc '0-9') ))
             RI=$((RID / ROOMS_PER_RELEASE))
             if [ "$RI" != "$GROUP" ]; then
-              # flush previous group
               if [ -n "$GROUP_FILES" ]; then
                 TAG=$(printf '%s\n' "$TAGS" | sed -n "$((GROUP + 1))p")
                 echo "Release $TAG: $COUNT rooms"
-                gh_retry gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
                 gh_retry gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
                   --title "Room data group $GROUP (auto)" \
                   --notes "Room group $GROUP for $DUMP_KEY" \
                   --prerelease --draft
-                # Upload in chunks of 50 files with a pause between
-                # chunks to stay under the uploads API rate limit.
-                CHUNK_FILES=""
-                CHUNK_N=0
                 for gf in $GROUP_FILES; do
-                  CHUNK_FILES="$CHUNK_FILES $gf"
-                  CHUNK_N=$((CHUNK_N + 1))
-                  if [ "$CHUNK_N" -ge 50 ]; then
-                    gh_retry gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber $CHUNK_FILES
-                    sleep 20
-                    CHUNK_FILES=""
-                    CHUNK_N=0
-                  fi
+                  gh_retry gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "$gf"
+                  sleep 1.2
                 done
-                if [ -n "$CHUNK_FILES" ]; then
-                  gh_retry gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber $CHUNK_FILES
-                fi
                 gh_retry gh release edit "$TAG" --draft=false --repo "$GITHUB_REPOSITORY"
               fi
               GROUP=$RI
@@ -241,26 +178,14 @@ jobs:
           if [ -n "$GROUP_FILES" ]; then
             TAG=$(printf '%s\n' "$TAGS" | sed -n "$((GROUP + 1))p")
             echo "Release $TAG: $COUNT rooms"
-            gh_retry gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
             gh_retry gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
               --title "Room data group $GROUP (auto)" \
               --notes "Room group $GROUP for $DUMP_KEY" \
               --prerelease --draft
-            CHUNK_FILES=""
-            CHUNK_N=0
             for gf in $GROUP_FILES; do
-              CHUNK_FILES="$CHUNK_FILES $gf"
-              CHUNK_N=$((CHUNK_N + 1))
-              if [ "$CHUNK_N" -ge 50 ]; then
-                gh_retry gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber $CHUNK_FILES
-                sleep 20
-                CHUNK_FILES=""
-                CHUNK_N=0
-              fi
+              gh_retry gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "$gf"
+              sleep 1.2
             done
-            if [ -n "$CHUNK_FILES" ]; then
-              gh_retry gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber $CHUNK_FILES
-            fi
             gh_retry gh release edit "$TAG" --draft=false --repo "$GITHUB_REPOSITORY"
           fi
 
